@@ -1,0 +1,9 @@
+# Partition table for ESP32-S3-N16R8 (16MB flash)
+# Single huge app slot (~6.25 MB) + large SPIFFS for assets + coredump.
+# No OTA (single app), suitable for development with Arduino-as-IDF component.
+# Name,   Type, SubType,  Offset,    Size,     Flags
+nvs,      data, nvs,      0x9000,    0x5000,
+otadata,  data, ota,      0xe000,    0x2000,
+app0,     app,  ota_0,    0x10000,   0x640000,
+spiffs,   data, spiffs,   0x650000,  0x9A0000,
+coredump, data, coredump, 0xFF0000,  0x10000,

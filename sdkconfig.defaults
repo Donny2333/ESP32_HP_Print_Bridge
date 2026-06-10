@@ -1,0 +1,50 @@
+# =============================================================================
+#  sdkconfig overrides for ESP32-S3 USB Host Print Bridge
+#  - Enable USB Host stack (USB OTG internal PHY)
+#  - Enable 8MB Octal PSRAM
+#  - Route ESP_LOG to USB-Serial-JTAG (so log works while OTG is busy with M1136)
+# =============================================================================
+
+# --- USB Host ---
+CONFIG_USB_OTG_SUPPORTED=y
+CONFIG_USB_HOST_HW_BUFFER_BIAS_BALANCED=y
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=256
+
+# --- PSRAM (ESP32-S3 N16R8: 8MB Octal) ---
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_CACHE_WORKAROUND=y
+
+# --- Flash ---
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# --- FreeRTOS ---
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_UNICORE=n
+
+# --- Task watchdog: long USB bulk transfers can stall up to a few seconds ---
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+CONFIG_ESP_TASK_WDT_PANIC=n
+
+# --- Log routed to USB-Serial-JTAG (the second USB port on the dev board) ---
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG_ENABLED=y
+
+# --- TCP / LWIP tuning for raw9100 throughput ---
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+
+# --- CPU ---
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+
+# --- Arduino as ESP-IDF component ---
+# Let Arduino auto-start app_main() (calls setup()/loop()).
+CONFIG_AUTOSTART_ARDUINO=y
