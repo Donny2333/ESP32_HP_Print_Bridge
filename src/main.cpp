@@ -82,10 +82,7 @@ static const size_t kStreamBufBytes = 256 * 1024;
 // (Full Speed). We pack multiple packets into a single transfer.
 static const size_t kUsbChunkBytes  = 1024;
 
-// Bulk-IN read buffer
-static const size_t kUsbInBufBytes  = 512;
 static const uint32_t kDrainQuiescentMs = 1500;
-static const uint32_t kJobCompleteQuietMs = 500;
 static const uint32_t kFinWaitMs = 8000;
 // How long to wait for the printer to become ready (USB attached) when TCP
 // data already arrived but no device is present yet.
@@ -121,9 +118,7 @@ static volatile bool     s_printerReady  = false;
 static char              s_printerIdent[160] = "(no printer)";
 static char              s_deviceId[256]     = "";   // IEEE 1284 device ID string
 static volatile uint32_t s_lastRecvActivityMs = 0;
-static volatile bool     s_jobComplete        = false;
-static volatile uint32_t s_jobCompleteMs      = 0;
-static volatile uint32_t s_jobGeneration      = 0;
+
 // Timestamp of last successful USB Bulk OUT write.  Used by rawServerTask
 // to detect "printing finished" (USB idle) and inject synthetic status.
 static volatile uint32_t s_lastUsbWriteMs     = 0;
@@ -219,89 +214,6 @@ static bool waitForPrinter(uint32_t timeoutMs)
   return true;
 }
 
-static bool bufferContains(const uint8_t *buf, size_t len, const char *needle)
-{
-  size_t n = strlen(needle);
-  if (n == 0 || len < n) return false;
-  const uint8_t *pat = reinterpret_cast<const uint8_t *>(needle);
-  for (size_t i = 0; i + n <= len; i++)
-  {
-    if (memcmp(buf + i, pat, n) == 0) return true;
-  }
-  return false;
-}
-
-static bool scanForJobEnd(const uint8_t *data, size_t len, uint32_t jobGen)
-{
-  if (!data || len == 0) return false;
-
-  static uint8_t  tail[64];
-  static size_t   tailLen = 0;
-  static uint32_t tailGen = 0;
-
-  if (jobGen != tailGen)
-  {
-    tailLen = 0;
-    tailGen = jobGen;
-  }
-
-  uint8_t window[sizeof(tail) + kUsbInBufBytes];
-  size_t winLen = 0;
-
-  if (tailLen > 0)
-  {
-    memcpy(window, tail, tailLen);
-    winLen = tailLen;
-  }
-
-  if (len > 0)
-  {
-    size_t copyLen = len;
-    if (winLen + copyLen > sizeof(window))
-    {
-      copyLen = sizeof(window) - winLen;
-    }
-    memcpy(window + winLen, data, copyLen);
-    winLen += copyLen;
-  }
-
-  static const char *kNeedles[] = {
-    "@PJL USTATUS JOB\r\nEND",
-    "@PJL EOJ",
-    "DISPLAY=\"JOB COMPLETE\"",
-    "CODE=8010",
-    "CODE=8011"
-  };
-
-  bool found = false;
-  for (size_t i = 0; i < (sizeof(kNeedles) / sizeof(kNeedles[0])); i++)
-  {
-    if (bufferContains(window, winLen, kNeedles[i]))
-    {
-      found = true;
-      break;
-    }
-  }
-
-  const size_t keep = 32;
-  if (winLen > keep)
-  {
-    tailLen = keep;
-    memcpy(tail, window + winLen - tailLen, tailLen);
-  }
-  else
-  {
-    tailLen = winLen;
-    memcpy(tail, window, tailLen);
-  }
-
-  if (found)
-  {
-    tailLen = 0;
-  }
-
-  return found;
-}
 
 // -----------------------------------------------------------------------------
 // USB host: library task (drains library-level events)
@@ -1003,19 +915,6 @@ static void usbWriterTask(void *arg)
 // USB host: bulk IN reader task - keeps printer-side FIFO drained
 // -----------------------------------------------------------------------------
 
-static void IRAM_ATTR readXferCb(usb_transfer_t *xfer)
-{
-  WriteCtx *ctx = (WriteCtx *)xfer->context;
-  if (ctx)
-  {
-    ctx->status = (xfer->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
-    ctx->actual = xfer->actual_num_bytes;
-    BaseType_t hpw = pdFALSE;
-    xSemaphoreGiveFromISR(ctx->done, &hpw);
-    if (hpw) portYIELD_FROM_ISR();
-  }
-}
-
 static void usbReaderTask(void *arg)
 {
   logTeeln("[usb-in] task disabled (Bulk IN polling off for stability)");
@@ -1142,9 +1041,6 @@ static void rawServerTask(void *arg)
     uint32_t jobId = jobBegin(peerIp);
     logTee("[raw9100] job #%u start\n", (unsigned)jobId);
 
-    s_jobGeneration++;
-    s_jobComplete   = false;
-    s_jobCompleteMs = 0;
     s_usbConsecutiveErrors = 0;
     s_syntheticInjected = false;
     s_lastUsbWriteMs = 0;
@@ -1195,14 +1091,6 @@ static void rawServerTask(void *arg)
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
           uint32_t now = millis();
-
-          // Fast path: PJL job-complete detected by Bulk IN parser
-          if (s_jobComplete && (now - s_jobCompleteMs) >= kJobCompleteQuietMs)
-          {
-            closeReason = JCR_JOB_COMPLETE;
-            logTeeln("[raw9100] PJL job-complete detected, closing");
-            break;
-          }
 
           // USB is broken: sustained errors mean the printer can't accept
           // more data; continuing to recv from CUPS is pointless.
@@ -1296,8 +1184,7 @@ static void rawServerTask(void *arg)
         lastOutChangeMs = now;
       }
       bool usbQuiescent = streamEmpty && (now - lastOutChangeMs) >= kDrainQuiescentMs;
-      bool jobDoneSignal = s_jobComplete && (now - s_jobCompleteMs) >= kJobCompleteQuietMs;
-      if (closeReason == JCR_JOB_COMPLETE || jobDoneSignal || usbQuiescent)
+      if (closeReason == JCR_JOB_COMPLETE || usbQuiescent)
       {
         break;
       }
@@ -1382,7 +1269,6 @@ static void rawServerTask(void *arg)
     // Finalise the JobRecord after USB drain so bytes_out / usb counters
     // reflect the actual outcome, not just the TCP-side state.
     jobEnd(closeReason);
-    s_jobComplete = false;
   }
 }
 

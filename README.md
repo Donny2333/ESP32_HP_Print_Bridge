@@ -416,6 +416,44 @@ USB 控制传输（`GET_DEVICE_ID`、`GET_PORT_STATUS`）的完成回调需要 `
 
 ---
 
+## ESP-IDF v4.4 USB Host 已知限制
+
+以下问题在开发/调试过程中被发现，属于 ESP-IDF v4.4 的 USB Host 子系统限制，无法在用户层完全绕开。记录于此供后续升级参考。
+
+### 1. Bulk IN 与 Bulk OUT 并发提交导致 panic 重启
+
+**现象**：当 `usbReaderTask`（Bulk IN）和 `usbWriterTask`（Bulk OUT）同时向 USB Host driver 提交 transfer 时，ESP32 发生 panic 重启。
+**错误码**：无明确 assert 消息（重启后 logSink ring 被清零）。
+**规避方式**：完全禁用 Bulk IN polling。
+
+### 2. Bulk IN `usb_host_transfer_submit` 返回 0x103 (ESP_ERR_INVALID_STATE)
+
+**现象**：即使端点已 claim、已 flush/clear，Bulk IN submit 持续返回 `ESP_ERR_INVALID_STATE`。
+**尝试过的恢复方式**（均无效）：
+- `usb_host_endpoint_halt` + `usb_host_endpoint_flush` + `usb_host_endpoint_clear`
+- 延长 / 缩短 transfer timeout
+- 每次 alloc 全新 transfer（排除 reuse 问题）
+
+### 3. Bulk IN `usb_host_transfer_submit` 返回 0x10c (ESP_ERR_NOT_ALLOWED)
+
+**现象**：使用持久化 transfer 对象（预分配不释放）时，submit 返回 `ESP_ERR_NOT_ALLOWED`。
+**原因**：driver 认为该 transfer 仍处于 in-flight 状态（前一次的 callback 可能未被 dispatch）。
+**规避方式**：改为 per-call alloc/free 模型（每次提交新对象）。
+
+### 4. Control transfer callback 需要 handle_events 驱动
+
+**现象**：在 `clientEventCb` 回调中同步调用 `usbTryAttachDevice` → 其中 `usbCtrlSync` 提交 control transfer → 等待 semaphore → 永不完成（因为 `handle_events` 被回调本身阻塞）。
+**规避方式**：
+- `usbTryAttachDevice` 通过 `s_pendingAttachAddr` 延迟到主循环执行
+- `usbCtrlSync` 内部主动 pump `usb_host_client_handle_events`
+
+### 5. HP M1136 Bulk IN 行为不一致
+
+**现象**：同一台打印机在不同的连接周期中，Bulk IN 有时能返回 PJL USTATUS 数据（4-5 条消息），有时完全不响应（全部 timeout）。即使在能响应的连接中，打印完成后也不一定推送 `USTATUS JOB END` 或 `CODE=10001`（Ready）。
+**结论**：即使 Bulk IN 偶尔可用，也不能作为"作业结束"的唯一判据。合成注入是必须的兜底机制。
+
+---
+
 ## License & Credits
 
 私人项目，无 license 声明。基于：
