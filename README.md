@@ -88,28 +88,68 @@ JZJZ ...                         ← ZJStream magic
 │   ├── secrets.example.h       # Wi-Fi/mDNS 模板（提交到 git）
 │   └── secrets.h               # 你的实际凭据（**不提交**，已在 .gitignore）
 ├── src/
-│   ├── CMakeLists.txt          # IDF component register
-│   └── main.cpp                # 所有逻辑（~1100 行单文件）
+│   ├── CMakeLists.txt          # IDF component register（GLOB_RECURSE src/*.*）
+│   ├── main.cpp                # 启动/接线层：Wi-Fi、mDNS、缓冲分配、建任务、setup/loop
+│   ├── bridge_config.h         # 编译期配置常量 + USB Printer Class 请求码
+│   ├── bridge_state.h/.cpp     # 跨模块共享全局（UsbState、统计量、打印机状态）+ macToString
+│   ├── usb_bridge.h/.cpp       # USB Host：attach/detach、控制传输、Bulk OUT writer
+│   ├── net_server.h/.cpp       # 原生 lwIP TCP 服务：:9100 打印 + :9101 telnet 日志
+│   ├── http_status.h/.cpp      # HTTP :80 状态页 / /jobs / /tail / /reset
+│   ├── job_log.h/.cpp          # 每个打印任务的事后诊断环形缓冲（16 槽）
+│   └── log_sink.h/.cpp         # 日志环形缓冲（供 :9101 / /tail 远程旁路）
 └── lib/, test/                 # 未使用
 ```
 
+> 早期版本所有逻辑在单个 `main.cpp`（~1100 行）里；现已按子系统拆分为上述多文件。
+> 拆分为纯机械搬运（逻辑零改动）：跨文件共享的全局集中到 `bridge_state`，
+> 各子系统私有状态仍是文件内 `static`。`src/CMakeLists.txt` 用 `GLOB_RECURSE`
+> 自动纳入所有 `src/*.*`，新增文件无需手动登记。
+
 ---
 
-## 关键代码模块（`src/main.cpp`）
+## 关键代码模块
 
-| 模块 | 说明 |
+各子系统的入口任务与核心函数：
+
+### `usb_bridge.*` — USB Host
+
+| 函数 | 说明 |
 |---|---|
 | `usbHostLibTask` | 跑 USB Host 库事件循环 |
 | `usbClientTask` + `clientEventCb` | 处理 NEW_DEV / DEV_GONE，延迟调用 `usbTryAttachDevice` |
 | `descFindPrinterInterface` | 在 config descriptor 里找 Printer Class 接口 + bulk OUT/IN endpoint |
 | `usbTryAttachDevice` | 打开设备、claim 接口、读 Device ID、读 Port Status、预分配 OUT transfer |
 | `usbCtrlSync` | 同步控制传输，内部 pump `handle_events` 避免死锁 |
+| `usbCtrlGetDeviceId` / `usbCtrlGetPortStatus` / `usbCtrlSoftReset` | Printer Class 控制请求 |
 | `usbWriterTask` | 从 stream buffer 取数据，1024B 一块送 bulk OUT（持久化 transfer） |
-| `usbReaderTask` | **已禁用**（Bulk IN 在 ESP-IDF v4.4 下不稳定） |
+| `usbReaderTask` / `backFwdTask` | **已禁用**（Bulk IN 在 ESP-IDF v4.4 下不稳定） |
+| `waitForPrinter` | 阻塞等待打印机就绪（供 writer / raw server 复用） |
+
+### `net_server.*` — 原生 lwIP TCP
+
+| 函数 | 说明 |
+|---|---|
+| `openListenSocket` | 建监听 socket（SO_REUSEADDR），:9100 / :9101 共用 |
 | `rawServerTask` | TCP:9100 接收 → stream buffer → USB OUT；作业结束后注入合成 PJL 状态 |
-| `handleRoot` / `handleReset` / `handleJobs` | HTTP 状态页 / 软复位 / 任务历史 |
-| `startWifi` / `startMdns` / `startUsbHost` | 启动各子系统 |
-| `setup` / `loop` | 入口（loop 仅跑 HTTP server） |
+| `tcpLogTask` | TCP:9101 单连接日志流（新连接踢掉旧的） |
+
+### `http_status.*` — HTTP :80
+
+| 函数 | 说明 |
+|---|---|
+| `handleRoot` | `/` 状态页（Wi-Fi / 打印机 / 字节计数 / 最近任务摘要） |
+| `handleReset` | `/reset` 软复位打印机端口 |
+| `handleJobs` | `/jobs` 任务历史（JSON，或 `?fmt=html` 带 hex dump 的表格） |
+| `handleTail` / `handleTailTxt` | `/tail`、`/tail.txt` 日志快照 |
+
+### 其余
+
+| 模块 | 说明 |
+|---|---|
+| `main.cpp` (`setup`/`loop`) | 入口：起 log sink、分配缓冲、`startWifi`/`startMdns`/`startUsbHost`、建各任务；loop 仅跑 HTTP server |
+| `bridge_state.*` | 跨模块共享全局的唯一定义 + `extern` 声明（`s_usb`、统计量、`s_printerReady`/`s_deviceId`/`s_portStatus` 等） |
+| `bridge_config.h` | 全部编译期常量（Wi-Fi/端口/缓冲大小/超时阈值/USB 请求码） |
+| `job_log.*` / `log_sink.*` | 诊断环形缓冲（任务历史 / 远程日志旁路） |
 
 **任务/核心分配：**
 - Core 0：USB lib（pri 5）、USB client（pri 4）、USB writer（pri 4）、USB reader（pri 3，已禁用）
