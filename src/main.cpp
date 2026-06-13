@@ -87,11 +87,6 @@ static const size_t kUsbInBufBytes  = 512;
 static const uint32_t kDrainQuiescentMs = 1500;
 static const uint32_t kJobCompleteQuietMs = 500;
 static const uint32_t kFinWaitMs = 8000;
-// After data is fully drained to USB, wait this long for printer Bulk IN
-// to deliver a real status update. If nothing arrives, inject a synthetic
-// "Ready" PJL status so CUPS can clear media-needed-error and finish.
-static const uint32_t kSyntheticStatusDelayMs = 5000;
-
 // How long to wait for the printer to become ready (USB attached) when TCP
 // data already arrived but no device is present yet.
 static const uint32_t kPrinterReadyWaitMs = 5000;
@@ -166,8 +161,6 @@ static volatile uint32_t s_inErrorStreak = 0;
 static const    uint32_t kInErrorRecoveryThreshold = 10;
 
 // Macro to enable/disable synthetic PJL Ready injection (0=off)
-#define ENABLE_SYNTHETIC_READY 0
-
 // USB state shared between USB tasks
 struct UsbState
 {
@@ -1159,9 +1152,7 @@ static void rawServerTask(void *arg)
     s_lastRecvActivityMs = nowMs;
 
     // Publish the active client fd to the USB reader so back-channel
-    // (printer -> host) bytes can flow back over TCP.  HP M1130 PPD
-    // requests PJL USTATUS replies and CUPS will wait for them before
-    // sending the actual ZJStream payload.
+    // (printer -> host) bytes can flow back over TCP.
     s_rawClientFd = cfd;
 
     uint8_t closeReason = JCR_CLIENT_FIN;
@@ -1233,11 +1224,15 @@ static void rawServerTask(void *arg)
           // -------------------------------------------------------
           bool streamEmpty = (xStreamBufferBytesAvailable(s_stream) == 0);
           bool usbIdle     = s_lastUsbWriteMs != 0 &&
-                             (now - s_lastUsbWriteMs) >= 5000;
+                             (now - s_lastUsbWriteMs) >= 2000;
           bool hasData     = s_lastJobBytes > 0;
 
           if (streamEmpty && usbIdle && hasData && !s_syntheticInjected)
           {
+            // The HP rastertozjs readerProcess detects "end of job" by
+            // finding "@PJL USTATUS JOB\r\nEND" in the back-channel data.
+            // The \x0c (form feed) separates two PJL messages.
+            // This exact 107-byte format was verified working in job 148.
             static const char kSyntheticStatus[] =
               "\r\n@PJL USTATUS JOB\r\nEND\r\nNAME=\"job\"\r\nPAGES=1\r\n\x0c"
               "@PJL INFO STATUS\r\nCODE=10001\r\n"
@@ -1248,8 +1243,8 @@ static void rawServerTask(void *arg)
             s_syntheticInjected = true;
             logTee("[raw9100] injected synthetic Ready+JobEnd (%d bytes)\n", (int)w);
 
-            // After injection, wait 5s for CUPS to process, then force close
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            // After injection, wait 2s for CUPS to process, then force close
+            vTaskDelay(pdMS_TO_TICKS(2000));
             closeReason = JCR_JOB_COMPLETE;
             logTeeln("[raw9100] post-injection timeout, closing");
             break;
@@ -1325,34 +1320,6 @@ static void rawServerTask(void *arg)
     }
 
     logTeeln("[raw9100] drain complete");
-
-#if ENABLE_SYNTHETIC_READY
-    // ---------------------------------------------------------------
-    // After USB drain, inject a synthetic "Ready" PJL status into the
-    // TCP back-channel.  The HP rastertozjs CUPS filter's readThread
-    // parses Bulk IN data for PJL USTATUS/INFO STATUS messages.  If
-    // the printer sent CODE=41102 ("Manual Feed") at job start, the
-    // filter sets CUPS state "media-needed-error" and won't clear it
-    // until a new status (like CODE=10001 "Ready") arrives.  On this
-    // printer, the Bulk IN endpoint often doesn't deliver a post-job
-    // status update in time (or at all).  Sending a synthetic status
-    // unblocks the CUPS filter so the backend can finish.
-    // ---------------------------------------------------------------
-    {
-      // HP PJL INFO STATUS format that rastertozjs understands:
-      static const char kReadyStatus[] =
-        "@PJL INFO STATUS\r\nCODE=10001\r\nDISPLAY=\"Ready\"\r\nONLINE=TRUE\r\n\x1b%-12345X";
-      int fd = s_rawClientFd;
-      if (fd >= 0)
-      {
-        ssize_t w = ::send(fd, kReadyStatus, sizeof(kReadyStatus) - 1, MSG_DONTWAIT);
-        logTee("[raw9100] injected synthetic Ready status (%d bytes sent)\n", (int)w);
-      }
-      // Give CUPS readThread time to parse the status and clear the
-      // media-needed-error state before we close the socket.
-      vTaskDelay(pdMS_TO_TICKS(kSyntheticStatusDelayMs));
-    }
-#endif
 
     logTeeln("[raw9100] sending FIN");
     ::shutdown(cfd, SHUT_WR);

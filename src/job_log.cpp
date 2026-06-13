@@ -127,6 +127,7 @@ extern "C" void jobAppendPayload(const uint8_t *data, size_t len)
   if (s_open)
   {
     JobRecord &j = s_jobs[s_head];
+    uint32_t prevBytesIn = j.bytes_in;
     j.bytes_in += (uint32_t)len;
 
     if (j.first64_len < kFirst64Cap)
@@ -135,9 +136,37 @@ extern "C" void jobAppendPayload(const uint8_t *data, size_t len)
       size_t take = (len < want) ? len : want;
       memcpy(j.first64 + j.first64_len, data, take);
       j.first64_len += (uint8_t)take;
-      // Re-classify each time we get more head bytes; classification is
-      // monotonic / cheap.
-      j.sig = classify(j.first64, j.first64_len);
+    }
+
+    // Re-classify: scan the incoming data chunk directly for signatures.
+    // The first64 buffer is only 64 bytes but the ZJS token
+    // ("ENTER LANGUAGE=ZJS") typically appears around byte 80-100.
+    // By scanning each incoming chunk we can detect it without enlarging
+    // the struct.  Use prevBytesIn (before this append) for the threshold.
+    if (j.sig != SIG_HP_UEL_PJL_ZJS && prevBytesIn < 2048)
+    {
+      // Check the first64 buffer
+      JobSig s = classify(j.first64, j.first64_len);
+      if (s == SIG_HP_UEL_PJL_ZJS)
+      {
+        j.sig = s;
+      }
+      else
+      {
+        // Also scan the current data chunk (covers bytes beyond first64)
+        bool hasPjl = containsAscii(j.first64, j.first64_len, "@PJL") ||
+                      containsAscii(data, len, "@PJL");
+        bool hasZjs = containsAscii(j.first64, j.first64_len, "ZJS") ||
+                      containsAscii(data, len, "ZJS");
+        if (hasPjl && hasZjs)
+        {
+          j.sig = SIG_HP_UEL_PJL_ZJS;
+        }
+        else if (s != SIG_UNKNOWN)
+        {
+          j.sig = s;  // keep best classification so far (e.g. PJL_NO_ZJS)
+        }
+      }
     }
   }
   portEXIT_CRITICAL(&s_mux);

@@ -97,22 +97,22 @@ JZJZ ...                         ← ZJStream magic
 
 ## 关键代码模块（`src/main.cpp`）
 
-| 模块 | 行号 | 说明 |
-|---|---|---|
-| `usbHostLibTask` | 162 | 跑 USB Host 库事件循环 |
-| `usbClientTask` + `clientEventCb` | 209 / 189 | 处理 NEW_DEV / DEV_GONE |
-| `descFindPrinterInterface` | 241 | 在 config descriptor 里找 Printer Class 接口 + bulk OUT/IN endpoint |
-| `usbTryAttachDevice` | 320 | 打开设备、claim 接口、读 Device ID、读 Port Status |
-| `usbCtrlGetDeviceId` / `usbCtrlGetPortStatus` / `usbCtrlSoftReset` | 539 / 576 / 589 | 三个 USB Printer Class control 请求 |
-| `usbWriterTask` + `usbBulkOutSync` | 660 / 618 | 从 stream buffer 取数据，1024B 一块送 bulk OUT |
-| `usbReaderTask` | 724 | 持续从 bulk IN 收打印机回包（PJL USTATUS） |
-| `rawServerTask` | 789 | TCP:9100 接收，推 stream buffer |
-| `handleRoot` / `handleReset` | 912 / 954 | HTTP 状态页 + 软复位入口 |
-| `startWifi` / `startMdns` / `startUsbHost` | 971 / 996 / 1024 | 启动各子系统 |
-| `setup` / `loop` | 1065 / 1100 | 入口 |
+| 模块 | 说明 |
+|---|---|
+| `usbHostLibTask` | 跑 USB Host 库事件循环 |
+| `usbClientTask` + `clientEventCb` | 处理 NEW_DEV / DEV_GONE，延迟调用 `usbTryAttachDevice` |
+| `descFindPrinterInterface` | 在 config descriptor 里找 Printer Class 接口 + bulk OUT/IN endpoint |
+| `usbTryAttachDevice` | 打开设备、claim 接口、读 Device ID、读 Port Status、预分配 OUT transfer |
+| `usbCtrlSync` | 同步控制传输，内部 pump `handle_events` 避免死锁 |
+| `usbWriterTask` | 从 stream buffer 取数据，1024B 一块送 bulk OUT（持久化 transfer） |
+| `usbReaderTask` | **已禁用**（Bulk IN 在 ESP-IDF v4.4 下不稳定） |
+| `rawServerTask` | TCP:9100 接收 → stream buffer → USB OUT；作业结束后注入合成 PJL 状态 |
+| `handleRoot` / `handleReset` / `handleJobs` | HTTP 状态页 / 软复位 / 任务历史 |
+| `startWifi` / `startMdns` / `startUsbHost` | 启动各子系统 |
+| `setup` / `loop` | 入口（loop 仅跑 HTTP server） |
 
 **任务/核心分配：**
-- Core 0：USB lib（pri 5）、USB client（pri 4）、USB writer（pri 4）、USB reader（pri 3）
+- Core 0：USB lib（pri 5）、USB client（pri 4）、USB writer（pri 4）、USB reader（pri 3，已禁用）
 - Core 1：raw9100 server（pri 3）、Arduino loop（HTTP server，pri 1）
 
 **数据流缓冲：**
@@ -232,20 +232,67 @@ coredump  0xFF0000   64K
 
 ## 已知问题与改进方向
 
-代码已经能跑通主路径，但深入审查后有以下值得修复的点（按重要性排序）。详情见对话/审查记录或源码注释。
-
-| # | 问题 | 位置 | 修复建议 |
+| # | 问题 | 状态 | 说明 |
 |---|---|---|---|
-| 1 | bulk OUT 每次都 `usb_host_transfer_alloc`，1MB 作业 alloc 千次 | `usbBulkOutSync` (618) | writer 任务里**只 alloc 一次** transfer，循环复用 |
-| 2 | reader 任务每次读完 `vTaskDelay(50ms)`，IN endpoint 可能阻塞 | `usbReaderTask` (781) | 不要 sleep，始终保持 IN transfer pending |
-| 3 | `GET_PORT_STATUS` / `SOFT_RESET` 的 `wIndex` 没左移 8 位 | (579, 591) | 改为 `((uint16_t)ifNumber << 8)` 同 `GET_DEVICE_ID` |
-| 4 | `printer not ready` 时丢弃流缓冲数据 | `usbWriterTask` (672–685) | 改为阻塞等待，或 TCP 层先拒绝连接 |
-| 5 | 控制传输跨任务调用（HTTP `/reset` vs USB client task）| `handleReset` (954) | 用 queue 把请求送到 client task 处理 |
-| 6 | `descFindPrinterInterface` 只接受 `alt == 0` | (274) | 若 MFP 在 alt 1/2 才有正确 endpoint 需要兼容 |
-| 7 | bulk OUT 超时 8s，大栅格页可能不够 | (692) | 改成 30s |
-| 8 | TCP idle 超时 10s，大作业可能误断 | (858) | 改成 30–60s |
-| 9 | Wi-Fi 重连后 mDNS 不重启 | `startWifi` (971) | 监听 WiFi event 自动 `MDNS.end()` + `startMdns()` |
-| 10 | 没有 OTA（huge_app.csv 单分区） | partitions | 长期使用建议改 dual OTA 分区表（牺牲 SPIFFS） |
+| 1 | bulk OUT 每次 alloc | **已修复** | 持久化 `s_outXfer`，writer 任务复用 |
+| 2 | Bulk IN 与 OUT 并发导致 ESP32 重启 | **已规避** | 禁用 Bulk IN polling（详见下文） |
+| 3 | `wIndex` 编码错误 | **已修复** | `GET_PORT_STATUS` / `SOFT_RESET` 已正确左移 8 位 |
+| 4 | 打印队列永不结束 | **已修复** | 合成 PJL `USTATUS JOB END` 注入（详见下文） |
+| 5 | TCP idle 超时过短 | **已修复** | `SO_RCVTIMEO=2s` + 120s 兜底 |
+| 6 | ZJS 签名误报 `PJL_NO_ZJS` | **已修复** | 扫描 incoming chunk 直接检测 ZJS token |
+| 7 | `printer not ready` 时丢弃数据 | 未修复 | 改为阻塞等待或 TCP 层拒绝 |
+| 8 | 控制传输跨任务调用 | 未修复 | HTTP `/reset` 应通过 queue 送到 client task |
+| 9 | Wi-Fi 重连后 mDNS 不重启 | 未修复 | 监听 WiFi event 自动重启 mDNS |
+| 10 | 没有 OTA | 未修复 | 长期使用建议改 dual OTA 分区表 |
+
+---
+
+## 打印队列完成机制（关键实现说明）
+
+### 问题背景
+
+macOS 通过 HP JetDirect（TCP:9100）协议打印时，CUPS 的 `rastertozjs` filter 会：
+1. 在 PJL 序言中发送 `@PJL USTATUS JOB=ON` 开启状态推送
+2. 通过 TCP 回读通道（printer → Mac）监听打印机回送的 PJL 状态
+3. 等待收到 `@PJL USTATUS JOB\r\nEND` 才认为作业完成
+
+如果打印机的状态更新从未到达 Mac（因为 Bulk IN 被禁用），CUPS 会永远等待，打印队列永远显示"正在打印"。
+
+### 解决方案：合成 PJL 状态注入
+
+ESP32 在检测到 **USB Bulk OUT 流量已静默 2 秒**（表示打印数据已全部写入打印机）后，**主动向 TCP 回送通道注入** 107 字节的合成 PJL 状态消息：
+
+```
+\r\n@PJL USTATUS JOB\r\nEND\r\nNAME="job"\r\nPAGES=1\r\n\x0c
+@PJL INFO STATUS\r\nCODE=10001\r\nDISPLAY="Ready"\r\nONLINE=TRUE\r\n
+```
+
+关键格式要求（经 CUPS debug 日志验证）：
+- `@PJL USTATUS JOB\r\nEND` 触发 readerProcess 的 `detected end of job`
+- `\x0c`（form feed）作为两段 PJL 消息的分隔符
+- `CODE=10001` 清除打印机 `media-needed-error` 等错误状态
+- 注入后等待 2 秒让 CUPS 处理，然后发 TCP FIN
+
+### 为什么禁用 Bulk IN
+
+HP M1136 通过 ESP-IDF v4.4 USB Host API 的 Bulk IN 端点存在严重稳定性问题：
+
+- `usb_host_transfer_submit` 对 Bulk IN 持续返回 `ESP_ERR_INVALID_STATE` (0x103)
+- Bulk IN 与 Bulk OUT 并发提交触发 USB Host driver 内部 race condition → ESP32 panic 重启
+- `usb_host_endpoint_clear/halt/flush` 无法可靠恢复端点状态
+
+因此当前固件**完全禁用了 Bulk IN polling**（`usbReaderTask` 进入永久 sleep），改为合成注入方案。
+
+**影响**：打印机的真实状态（卡纸、缺纸等）不会通过 macOS 打印队列显示。正常打印和队列退出不受影响。
+
+**未来恢复方案**：升级 ESP-IDF 到 v5.x 后重新启用 Bulk IN polling。
+
+### 控制传输的事件循环兼容
+
+USB 控制传输（`GET_DEVICE_ID`、`GET_PORT_STATUS`）的完成回调需要 `usb_host_client_handle_events()` dispatch。为避免死锁：
+
+1. `usbTryAttachDevice()` 不在 `clientEventCb` 回调中直接调用，而是通过 `s_pendingAttachAddr` 标志延迟到 `usbClientTask` 主循环中执行
+2. `usbCtrlSync()` 在等待控制传输完成时主动 pump `usb_host_client_handle_events()`
 
 ---
 
@@ -336,7 +383,7 @@ coredump  0xFF0000   64K
 | 端口 | 协议 | 用途 |
 |---|---|---|
 | `:80` | HTTP | 状态页 `/`、任务历史 `/jobs`、日志快照 `/tail`、`/tail.txt`、软复位 `/reset` |
-| `:9100` | TCP raw | HP JetDirect 打印数据 |
+| `:9100` | TCP raw | HP JetDirect 打印数据（双向：OUT=打印流，IN=合成 PJL 状态） |
 | `:9101` | TCP telnet | 实时日志流（`nc esp32-printer.local 9101`） |
 
 > **可达性提示**：以上端口都绑 0.0.0.0，只要 Mac 和 ESP32 在同一局域网（路由器未开启"AP 隔离 / Client Isolation"）就能直连。无需公网、无需 VPN、无需云服务。如 `.local` 不解析，直接用 IP（看状态页或路由器后台获取）。
