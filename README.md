@@ -251,6 +251,98 @@ coredump  0xFF0000   64K
 
 ## 故障排查
 
+### 远程排错（第一件事就做这个）
+
+固件内置了**任务历史 + 实时日志旁路**，绝大多数"不出纸"问题在 macOS 终端里 30 秒就能定位，不需要 USB-Serial-JTAG 线。
+
+#### 远程"串口"：通过 Wi-Fi 看 ESP32 的全部日志
+
+适合 **物理上 ESP32 OTG 接打印机、Serial-JTAG 口不方便接电脑** 的场景。所有原本写到 USB-Serial-JTAG 的日志会同时镜像到 Wi-Fi 端：
+
+| 用法 | 命令 | 说明 |
+|---|---|---|
+| **实时滚动**（最像 `screen /dev/cu.*`） | `nc esp32-printer.local 9101` | 连上后先看到 ring 里的近期日志快照 + banner，然后实时追加 |
+| **浏览器快照** | 打开 `http://esp32-printer.local/tail` | 8 KB 日志快照，HTML 着色 |
+| **纯文本快照** | `curl 'http://esp32-printer.local/tail.txt?n=4096'` | 适合 grep / less |
+| **任务历史** | `curl http://esp32-printer.local/jobs \| jq` | 见下文"任务结果" |
+
+约定：
+- 远程日志行前会自带毫秒级时间戳 `[12345] ...`，便于排序与对照
+- 本地 USB-Serial-JTAG 输出**不变**（保持无时间戳的原样）
+- :9101 同一时刻只允许一个连接；新连接会自动踢掉旧的
+- 慢/失联的客户端会被立即丢弃，不会拖慢主循环
+
+**SOP（按顺序做）：**
+
+1. **看最近一次任务的体检报告**
+   ```bash
+   curl -s http://esp32-printer.local/jobs | jq '.[0]'
+   # 或浏览器打开 http://esp32-printer.local/jobs?fmt=html
+   ```
+   关注三个字段：
+   - `sig`：数据格式签名（见下表）
+   - `bytes_in` vs `bytes_out`：TCP 进的 vs USB 出的，**应相等**
+   - `usb_err_count` / `last_usb_err` / `bytes_dropped`：USB 段故障指示
+
+2. **看实时日志**（任何终端，零安装）
+   ```bash
+   nc esp32-printer.local 9101
+   ```
+   连接后会先发一段 ring 缓冲里的近期日志，然后流式追加新行。多 client 时新的会踢掉旧的。
+
+3. **看日志快照（浏览器友好）**
+   ```bash
+   open http://esp32-printer.local/tail              # HTML
+   curl http://esp32-printer.local/tail.txt          # 纯文本
+   curl 'http://esp32-printer.local/tail.txt?n=4096' # 限定大小
+   ```
+
+#### 签名速查表
+
+`/jobs` 里的 `sig` 字段直接告诉你头部是什么协议。
+
+| sig | 含义 | 结论 |
+|---|---|---|
+| `HP_UEL_PJL_ZJS` | 标准 HP UEL + `@PJL ENTER LANGUAGE=ZJS` + ZJStream | **数据正确**，问题不在主机驱动 |
+| `PJL_NO_ZJS` | 有 `@PJL` 但没切到 ZJS | 驱动 PJL 序言不对，M1136 不认 |
+| `POSTSCRIPT` | `%!PS-Adobe...` | **PPD 选错**，换 HP M1130/M1132 系列 |
+| `PWG_RASTER` | `RaS2` / `RaS3` | **PPD 选错**（AirPrint 路径），换 HP M1130 系列 |
+| `PDF` | `%PDF-` | 主机没经过驱动栅格化 |
+| `OTHER_BINARY` | 不匹配任何已知签名 | 看 `/jobs?fmt=html` 里的 hex dump 手工判断 |
+| `UNKNOWN` | 还没拿到 first64 字节 | 任务太短或 TCP 立即断 |
+
+#### 决策树
+
+```
+不出纸
+ │
+ ├─ /jobs 没有任何 record
+ │     → TCP 根本没连上，看 / 状态页 Wi-Fi / IP / mDNS
+ │
+ ├─ sig=HP_UEL_PJL_ZJS
+ │     ├─ in==out 且 usb_err=0   → 打印机收齐了不出纸（硬件/驱动器/PPD 在 PJL 之外的问题）
+ │     ├─ bytes_dropped > 0      → "printer not ready" 期间被丢；看实时日志找原因
+ │     └─ usb_err_count > 0      → USB 段卡，看 last_usb_err（0x103=TIMEOUT 0x108=STALL）
+ │
+ ├─ sig ∈ {POSTSCRIPT, PWG_RASTER, PDF, PJL_NO_ZJS}
+ │     → 100% 主机端驱动选错；换 "HP LaserJet Professional M1130 MFP Series" PPD
+ │
+ └─ sig=OTHER_BINARY / UNKNOWN
+       → 看 /jobs?fmt=html 的 hex dump 人工判断
+```
+
+#### 端口一览
+
+| 端口 | 协议 | 用途 |
+|---|---|---|
+| `:80` | HTTP | 状态页 `/`、任务历史 `/jobs`、日志快照 `/tail`、`/tail.txt`、软复位 `/reset` |
+| `:9100` | TCP raw | HP JetDirect 打印数据 |
+| `:9101` | TCP telnet | 实时日志流（`nc esp32-printer.local 9101`） |
+
+> **可达性提示**：以上端口都绑 0.0.0.0，只要 Mac 和 ESP32 在同一局域网（路由器未开启"AP 隔离 / Client Isolation"）就能直连。无需公网、无需 VPN、无需云服务。如 `.local` 不解析，直接用 IP（看状态页或路由器后台获取）。
+
+---
+
 ### 看不到日志
 - 确认电脑接的是 ESP32-S3 的 **USB-Serial-JTAG 口**（不是 OTG 口）
 - 端口名 macOS：`/dev/cu.usbmodem*`，Linux：`/dev/ttyACM*`
