@@ -42,6 +42,7 @@ enum JobCloseReason : uint8_t
   JCR_USB_ERROR     = 3,
   JCR_NO_PRINTER    = 4,
   JCR_OTHER         = 5,
+  JCR_JOB_COMPLETE  = 6,
 };
 
 struct JobRecord

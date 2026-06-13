@@ -258,6 +258,7 @@ extern "C" const char *jobCloseReasonName(uint8_t r)
     case JCR_USB_ERROR:    return "usb_error";
     case JCR_NO_PRINTER:   return "no_printer";
     case JCR_OTHER:        return "other";
+    case JCR_JOB_COMPLETE: return "job_complete";
     default:               return "?";
   }
 }

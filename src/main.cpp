@@ -25,6 +25,8 @@
 #include <ESPmDNS.h>
 #include <WebServer.h>
 
+#include <string.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -82,6 +84,13 @@ static const size_t kUsbChunkBytes  = 1024;
 
 // Bulk-IN read buffer
 static const size_t kUsbInBufBytes  = 512;
+static const uint32_t kDrainQuiescentMs = 1500;
+static const uint32_t kJobCompleteQuietMs = 500;
+static const uint32_t kFinWaitMs = 8000;
+// After data is fully drained to USB, wait this long for printer Bulk IN
+// to deliver a real status update. If nothing arrives, inject a synthetic
+// "Ready" PJL status so CUPS can clear media-needed-error and finish.
+static const uint32_t kSyntheticStatusDelayMs = 5000;
 
 // How long to wait for the printer to become ready (USB attached) when TCP
 // data already arrived but no device is present yet.
@@ -116,6 +125,18 @@ static volatile uint32_t s_lastJobBytes  = 0;
 static volatile bool     s_printerReady  = false;
 static char              s_printerIdent[160] = "(no printer)";
 static char              s_deviceId[256]     = "";   // IEEE 1284 device ID string
+static volatile uint32_t s_lastRecvActivityMs = 0;
+static volatile bool     s_jobComplete        = false;
+static volatile uint32_t s_jobCompleteMs      = 0;
+static volatile uint32_t s_jobGeneration      = 0;
+// Timestamp of last successful USB Bulk OUT write.  Used by rawServerTask
+// to detect "printing finished" (USB idle) and inject synthetic status.
+static volatile uint32_t s_lastUsbWriteMs     = 0;
+static volatile bool     s_syntheticInjected  = false;
+// Consecutive USB bulk-OUT error counter.  Reset on each successful write.
+// When this exceeds a threshold, rawServerTask should abandon the job.
+static volatile uint32_t s_usbConsecutiveErrors = 0;
+static const    uint32_t kMaxConsecutiveUsbErrors = 5;
 // Port status sentinel: 0xFF means "we tried to read but the printer didn't
 // answer (timeout / stall)" - this is common on hub-attached HP M1132/M1136
 // printers that don't implement class-specific control requests reliably.
@@ -123,6 +144,29 @@ static char              s_deviceId[256]     = "";   // IEEE 1284 device ID stri
 // uses bits 3, 4, 5; 0xFF cannot occur as a genuine status.
 static constexpr uint8_t kPortStatusUnknown = 0xFF;
 static volatile uint8_t  s_portStatus        = kPortStatusUnknown;
+
+// Back-channel ring buffer: printer Bulk IN → this buffer → TCP client.
+// Allocated in PSRAM.  usbReaderTask writes; backFwdTask reads.
+static const size_t     kBackBufBytes = 16 * 1024;
+static StreamBufferHandle_t s_backBuf        = nullptr;
+static uint8_t             *s_backBufStorage = nullptr;
+static StaticStreamBuffer_t s_backBufCb;
+
+// Pre-allocated persistent USB OUT transfer (avoid per-chunk alloc/free)
+static usb_transfer_t  *s_outXfer = nullptr;
+static SemaphoreHandle_t s_outDone = nullptr;
+
+// Mutex to serialise Bulk OUT and Bulk IN submissions on the same USB
+// host client.  ESP-IDF v4.4 USB host driver is not fully re-entrant
+// when two tasks submit transfers concurrently on the same device.
+static SemaphoreHandle_t s_usbSubmitMux = nullptr;
+
+// Bulk IN endpoint error streak counter for auto-recovery
+static volatile uint32_t s_inErrorStreak = 0;
+static const    uint32_t kInErrorRecoveryThreshold = 10;
+
+// Macro to enable/disable synthetic PJL Ready injection (0=off)
+#define ENABLE_SYNTHETIC_READY 0
 
 // USB state shared between USB tasks
 struct UsbState
@@ -146,6 +190,7 @@ static void usbHostLibTask(void *arg);
 static void usbClientTask(void *arg);
 static void usbWriterTask(void *arg);
 static void usbReaderTask(void *arg);
+static void backFwdTask(void *arg);
 static void rawServerTask(void *arg);
 static bool usbTryAttachDevice(uint8_t devAddr);
 static void usbDetach();
@@ -181,6 +226,90 @@ static bool waitForPrinter(uint32_t timeoutMs)
   return true;
 }
 
+static bool bufferContains(const uint8_t *buf, size_t len, const char *needle)
+{
+  size_t n = strlen(needle);
+  if (n == 0 || len < n) return false;
+  const uint8_t *pat = reinterpret_cast<const uint8_t *>(needle);
+  for (size_t i = 0; i + n <= len; i++)
+  {
+    if (memcmp(buf + i, pat, n) == 0) return true;
+  }
+  return false;
+}
+
+static bool scanForJobEnd(const uint8_t *data, size_t len, uint32_t jobGen)
+{
+  if (!data || len == 0) return false;
+
+  static uint8_t  tail[64];
+  static size_t   tailLen = 0;
+  static uint32_t tailGen = 0;
+
+  if (jobGen != tailGen)
+  {
+    tailLen = 0;
+    tailGen = jobGen;
+  }
+
+  uint8_t window[sizeof(tail) + kUsbInBufBytes];
+  size_t winLen = 0;
+
+  if (tailLen > 0)
+  {
+    memcpy(window, tail, tailLen);
+    winLen = tailLen;
+  }
+
+  if (len > 0)
+  {
+    size_t copyLen = len;
+    if (winLen + copyLen > sizeof(window))
+    {
+      copyLen = sizeof(window) - winLen;
+    }
+    memcpy(window + winLen, data, copyLen);
+    winLen += copyLen;
+  }
+
+  static const char *kNeedles[] = {
+    "@PJL USTATUS JOB\r\nEND",
+    "@PJL EOJ",
+    "DISPLAY=\"JOB COMPLETE\"",
+    "CODE=8010",
+    "CODE=8011"
+  };
+
+  bool found = false;
+  for (size_t i = 0; i < (sizeof(kNeedles) / sizeof(kNeedles[0])); i++)
+  {
+    if (bufferContains(window, winLen, kNeedles[i]))
+    {
+      found = true;
+      break;
+    }
+  }
+
+  const size_t keep = 32;
+  if (winLen > keep)
+  {
+    tailLen = keep;
+    memcpy(tail, window + winLen - tailLen, tailLen);
+  }
+  else
+  {
+    tailLen = winLen;
+    memcpy(tail, window, tailLen);
+  }
+
+  if (found)
+  {
+    tailLen = 0;
+  }
+
+  return found;
+}
+
 // -----------------------------------------------------------------------------
 // USB host: library task (drains library-level events)
 // -----------------------------------------------------------------------------
@@ -212,6 +341,9 @@ static void usbHostLibTask(void *arg)
 // USB host: client event callback + client task
 // -----------------------------------------------------------------------------
 
+// Pending attach address - set by callback, consumed by task loop.
+static volatile uint8_t s_pendingAttachAddr = 0;
+
 static void clientEventCb(const usb_host_client_event_msg_t *msg, void *arg)
 {
   switch (msg->event)
@@ -220,7 +352,7 @@ static void clientEventCb(const usb_host_client_event_msg_t *msg, void *arg)
       logTee("[usb-cli] NEW_DEV addr=%u\n", msg->new_dev.address);
       if (!s_usb.claimed)
       {
-        usbTryAttachDevice(msg->new_dev.address);
+        s_pendingAttachAddr = msg->new_dev.address;
       }
       break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
@@ -252,10 +384,20 @@ static void usbClientTask(void *arg)
 
   for (;;)
   {
-    err = usb_host_client_handle_events(s_usb.client, pdMS_TO_TICKS(1000));
+    err = usb_host_client_handle_events(s_usb.client, pdMS_TO_TICKS(50));
     if (err != ESP_OK && err != ESP_ERR_TIMEOUT)
     {
       logTee("[usb-cli] handle_events err=0x%x\n", err);
+    }
+
+    // Process pending attach outside of the event callback so that
+    // control transfers (GET_DEVICE_ID etc.) can complete — their
+    // callbacks are dispatched by handle_events which we must not block.
+    uint8_t addr = s_pendingAttachAddr;
+    if (addr != 0)
+    {
+      s_pendingAttachAddr = 0;
+      usbTryAttachDevice(addr);
     }
   }
 }
@@ -469,6 +611,24 @@ static bool usbTryAttachDevice(uint8_t devAddr)
   // Attach handshake done (success or graceful failure).  Now publish ready.
   s_printerReady = true;
   logTeeln("[usb-cli] printer attached and ready");
+
+  // Pre-allocate persistent Bulk OUT transfer
+  if (s_outXfer == nullptr)
+  {
+    if (usb_host_transfer_alloc(kUsbChunkBytes, 0, &s_outXfer) == ESP_OK)
+    {
+      s_outDone = xSemaphoreCreateBinary();
+      logTeeln("[usb-cli] pre-allocated OUT transfer");
+    }
+    else
+    {
+      logTeeln("[usb-cli] WARN: OUT transfer pre-alloc failed, will use per-call alloc");
+      s_outXfer = nullptr;
+    }
+  }
+
+  s_inErrorStreak = 0;
+
   return true;
 }
 
@@ -494,6 +654,17 @@ static void usbDetach()
   s_usb.epIn     = 0;
   s_usb.epOutMps = 0;
   s_usb.epInMps  = 0;
+  // Free persistent transfers
+  if (s_outXfer)
+  {
+    usb_host_transfer_free(s_outXfer);
+    s_outXfer = nullptr;
+  }
+  if (s_outDone)
+  {
+    vSemaphoreDelete(s_outDone);
+    s_outDone = nullptr;
+  }
   s_printerReady = false;
   s_deviceId[0]  = '\0';
   s_portStatus   = kPortStatusUnknown;
@@ -564,11 +735,21 @@ static esp_err_t usbCtrlSync(uint8_t bmRequestType, uint8_t bRequest,
   err = usb_host_transfer_submit_control(s_usb.client, xfer);
   if (err == ESP_OK)
   {
-    if (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(timeoutMs + 200)) != pdTRUE)
+    // Pump the client event loop while waiting for the control transfer to
+    // complete.  The completion callback (ctrlXferCb) is dispatched by
+    // handle_events; if we just block on the semaphore, it will never fire
+    // because nobody is calling handle_events.
+    uint32_t deadline = millis() + timeoutMs + 200;
+    while (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(10)) != pdTRUE)
     {
-      err = ESP_ERR_TIMEOUT;
+      usb_host_client_handle_events(s_usb.client, pdMS_TO_TICKS(10));
+      if (millis() >= deadline)
+      {
+        err = ESP_ERR_TIMEOUT;
+        break;
+      }
     }
-    else
+    if (err == ESP_OK)
     {
       err = ctx.status;
     }
@@ -695,7 +876,9 @@ static esp_err_t usbBulkOutSync(const uint8_t *data, size_t len, uint32_t timeou
   xfer->context          = &ctx;
   xfer->timeout_ms       = timeoutMs;
 
+  if (s_usbSubmitMux) xSemaphoreTake(s_usbSubmitMux, portMAX_DELAY);
   err = usb_host_transfer_submit(xfer);
+  if (s_usbSubmitMux) xSemaphoreGive(s_usbSubmitMux);
   if (err == ESP_OK)
   {
     if (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(timeoutMs + 200)) != pdTRUE)
@@ -738,7 +921,6 @@ static void usbWriterTask(void *arg)
       {
         logTee("[usb-out] still no printer, discarding %u bytes\n", (unsigned)got);
         jobOnDropped(got);
-        // Drain remaining buffered data too so we don't loop forever
         size_t drained = 0;
         while (xStreamBufferReceive(s_stream, chunk, sizeof(chunk), 0) > 0)
         {
@@ -755,13 +937,59 @@ static void usbWriterTask(void *arg)
     {
       size_t n = got - off;
       if (n > kUsbChunkBytes) n = kUsbChunkBytes;
-      esp_err_t err = usbBulkOutSync(chunk + off, n, 8000);
+
+      esp_err_t err;
+
+      // Use persistent transfer if available, else fallback to alloc
+      if (s_outXfer && s_outDone)
+      {
+        memcpy(s_outXfer->data_buffer, chunk + off, n);
+        s_outXfer->num_bytes        = n;
+        s_outXfer->device_handle    = s_usb.device;
+        s_outXfer->bEndpointAddress = s_usb.epOut;
+        s_outXfer->callback         = writeXferCb;
+        s_outXfer->context          = nullptr;  // use global semaphore
+        s_outXfer->timeout_ms       = 8000;
+
+        // writeXferCb needs to give s_outDone
+        // We'll reuse WriteCtx pattern with the persistent semaphore
+        WriteCtx outCtx = {};
+        outCtx.done = s_outDone;
+        s_outXfer->context = &outCtx;
+
+        xSemaphoreTake(s_usbSubmitMux, portMAX_DELAY);
+        err = usb_host_transfer_submit(s_outXfer);
+        xSemaphoreGive(s_usbSubmitMux);
+        if (err == ESP_OK)
+        {
+          if (xSemaphoreTake(s_outDone, pdMS_TO_TICKS(8200)) != pdTRUE)
+          {
+            logTeeln("[usb-out] transfer timeout (semaphore)");
+            err = ESP_ERR_TIMEOUT;
+          }
+          else
+          {
+            err = outCtx.status;
+          }
+        }
+        else
+        {
+          logTee("[usb-out] submit err=0x%x\n", err);
+        }
+      }
+      else
+      {
+        // Fallback: per-call alloc (original path)
+        err = usbBulkOutSync(chunk + off, n, 8000);
+      }
+
       if (err != ESP_OK)
       {
-        logTee("[usb-out] bulk write err=0x%x at offset=%u\n", err, (unsigned)off);
+        s_usbConsecutiveErrors++;
+        logTee("[usb-out] bulk write err=0x%x at offset=%u (consecutive=%u)\n",
+               err, (unsigned)off, (unsigned)s_usbConsecutiveErrors);
         if (err == ESP_ERR_TIMEOUT) jobOnUsbTimeout();
         jobOnUsbErr((uint32_t)err);
-        // Try to clear stall
         if (s_usb.claimed)
         {
           usb_host_endpoint_clear(s_usb.device, s_usb.epOut);
@@ -769,8 +997,10 @@ static void usbWriterTask(void *arg)
         vTaskDelay(pdMS_TO_TICKS(20));
         break;
       }
+      s_usbConsecutiveErrors = 0;
       off += n;
       s_totalBytesOut += n;
+      s_lastUsbWriteMs = millis();
       jobOnUsbWrite(n);
     }
   }
@@ -783,98 +1013,31 @@ static void usbWriterTask(void *arg)
 static void IRAM_ATTR readXferCb(usb_transfer_t *xfer)
 {
   WriteCtx *ctx = (WriteCtx *)xfer->context;
-  ctx->status = (xfer->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
-  ctx->actual = xfer->actual_num_bytes;
-  BaseType_t hpw = pdFALSE;
-  xSemaphoreGiveFromISR(ctx->done, &hpw);
-  if (hpw) portYIELD_FROM_ISR();
+  if (ctx)
+  {
+    ctx->status = (xfer->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
+    ctx->actual = xfer->actual_num_bytes;
+    BaseType_t hpw = pdFALSE;
+    xSemaphoreGiveFromISR(ctx->done, &hpw);
+    if (hpw) portYIELD_FROM_ISR();
+  }
 }
 
 static void usbReaderTask(void *arg)
 {
-  logTeeln("[usb-in] task start");
+  logTeeln("[usb-in] task disabled (Bulk IN polling off for stability)");
+  for (;;) vTaskDelay(pdMS_TO_TICKS(10000));
+}
 
-  for (;;)
-  {
-    if (!s_printerReady || s_usb.epIn == 0)
-    {
-      vTaskDelay(pdMS_TO_TICKS(200));
-      continue;
-    }
+// -----------------------------------------------------------------------------
+// Back-channel forwarder task: drains s_backBuf and sends to TCP client.
+// Runs on core 1 to avoid contending with USB tasks on core 0.
+// -----------------------------------------------------------------------------
 
-    // Don't keep the bulk IN endpoint busy when no TCP client is around to
-    // receive the data.  Polling it constantly hurts the bulk OUT path on
-    // hub-attached HP M1130 printers (where IN transfers reliably time out
-    // and starve the IDF USB host client task).
-    if (s_rawClientFd < 0)
-    {
-      vTaskDelay(pdMS_TO_TICKS(200));
-      continue;
-    }
-
-    usb_transfer_t *xfer = nullptr;
-    if (usb_host_transfer_alloc(kUsbInBufBytes, 0, &xfer) != ESP_OK)
-    {
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
-    }
-
-    WriteCtx ctx = {};
-    ctx.done = xSemaphoreCreateBinary();
-
-    xfer->num_bytes        = kUsbInBufBytes;
-    xfer->device_handle    = s_usb.device;
-    xfer->bEndpointAddress = s_usb.epIn;
-    xfer->callback         = readXferCb;
-    xfer->context          = &ctx;
-    xfer->timeout_ms       = 2000;
-
-    esp_err_t err = usb_host_transfer_submit(xfer);
-    if (err == ESP_OK)
-    {
-      if (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(2500)) == pdTRUE)
-      {
-        if (ctx.status == ESP_OK && ctx.actual > 0)
-        {
-          s_totalBytesBack += ctx.actual;
-
-          // Forward back-channel bytes to current TCP client (PJL USTATUS
-          // replies, supplies levels, etc.).  CUPS waits for these before
-          // sending the actual print payload on M1130-class PPDs.
-          int fd = s_rawClientFd;
-          if (fd >= 0)
-          {
-            ssize_t w = ::send(fd, xfer->data_buffer, ctx.actual, MSG_DONTWAIT);
-            if (w > 0)
-            {
-              s_totalBackToClient += (uint32_t)w;
-            }
-          }
-
-          // Short ASCII preview - bulk IN replies are mostly PJL status text.
-          char preview[80];
-          size_t plen = ctx.actual < 32 ? ctx.actual : 32;
-          for (size_t i = 0; i < plen; i++)
-          {
-            uint8_t c = xfer->data_buffer[i];
-            preview[i] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
-          }
-          preview[plen] = '\0';
-          logTee("[usb-in] %u bytes (fwd=%d): %s\n",
-                 (unsigned)ctx.actual,
-                 (fd >= 0) ? 1 : 0,
-                 preview);
-        }
-      }
-    }
-
-    vSemaphoreDelete(ctx.done);
-    usb_host_transfer_free(xfer);
-
-    // Brief gap so the bulk OUT writer task can get USB host client time
-    // even when the printer is not answering bulk IN.
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
+static void backFwdTask(void *arg)
+{
+  logTeeln("[back-fwd] task disabled (no Bulk IN data)");
+  for (;;) vTaskDelay(pdMS_TO_TICKS(10000));
 }
 
 // -----------------------------------------------------------------------------
@@ -961,15 +1124,11 @@ static void rawServerTask(void *arg)
     inet_ntoa_r(peer.sin_addr, peerIp, sizeof(peerIp));
     logTee("[raw9100] connection from %s\n", peerIp);
 
-    // Configure the client socket: TCP_NODELAY + 10s idle read timeout.
+    // Configure the client socket: TCP_NODELAY + short idle read timeout so we
+    // can poll for job-complete signals.
     int yes = 1;
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-    // Idle read timeout: macOS CUPS often spends 10-30 s in rastertozjs
-    // rendering between the PJL header and the ZJStream payload, during
-    // which no bytes flow on the TCP socket.  10 s was triggering EPIPE
-    // on the CUPS side and aborting prints.  60 s is the README's
-    // recommended setting (known issue #8).
-    struct timeval idleTo = { .tv_sec = 60, .tv_usec = 0 };
+    struct timeval idleTo = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &idleTo, sizeof(idleTo));
 
     // If no printer is attached, hold briefly then refuse the job so the
@@ -990,6 +1149,15 @@ static void rawServerTask(void *arg)
     uint32_t jobId = jobBegin(peerIp);
     logTee("[raw9100] job #%u start\n", (unsigned)jobId);
 
+    s_jobGeneration++;
+    s_jobComplete   = false;
+    s_jobCompleteMs = 0;
+    s_usbConsecutiveErrors = 0;
+    s_syntheticInjected = false;
+    s_lastUsbWriteMs = 0;
+    uint32_t nowMs  = millis();
+    s_lastRecvActivityMs = nowMs;
+
     // Publish the active client fd to the USB reader so back-channel
     // (printer -> host) bytes can flow back over TCP.  HP M1130 PPD
     // requests PJL USTATUS replies and CUPS will wait for them before
@@ -1005,6 +1173,7 @@ static void rawServerTask(void *arg)
       {
         s_totalBytesIn += got;
         s_lastJobBytes += got;
+        s_lastRecvActivityMs = millis();
         jobAppendPayload(buf, (size_t)got);
 
         // Push to stream buffer; throttle on backpressure.
@@ -1026,24 +1195,80 @@ static void rawServerTask(void *arg)
       {
         // Peer closed (FIN).
         closeReason = JCR_CLIENT_FIN;
+        logTeeln("[raw9100] peer sent FIN");
         break;
       }
       else
       {
-        // got < 0; distinguish idle timeout from a real error.
+        // got < 0; SO_RCVTIMEO fires every 2s.
         if (errno == EAGAIN || errno == EWOULDBLOCK)
         {
-          logTeeln("[raw9100] idle timeout, closing");
-          closeReason = JCR_IDLE_TIMEOUT;
-          break;
+          uint32_t now = millis();
+
+          // Fast path: PJL job-complete detected by Bulk IN parser
+          if (s_jobComplete && (now - s_jobCompleteMs) >= kJobCompleteQuietMs)
+          {
+            closeReason = JCR_JOB_COMPLETE;
+            logTeeln("[raw9100] PJL job-complete detected, closing");
+            break;
+          }
+
+          // USB is broken: sustained errors mean the printer can't accept
+          // more data; continuing to recv from CUPS is pointless.
+          if (s_usbConsecutiveErrors >= kMaxConsecutiveUsbErrors)
+          {
+            closeReason = JCR_USB_ERROR;
+            logTee("[raw9100] USB stuck (%u consecutive errors), closing\n",
+                   (unsigned)s_usbConsecutiveErrors);
+            break;
+          }
+
+          // -------------------------------------------------------
+          // Synthetic Ready injection: once all print data has been
+          // forwarded to USB and the printer has been idle for a few
+          // seconds, inject a PJL "Ready" + "Job End" status back to
+          // CUPS so its readThread can clear media-needed-error and
+          // finish the job.  This is necessary because Bulk IN is
+          // disabled (crashes on this printer's USB host stack).
+          // -------------------------------------------------------
+          bool streamEmpty = (xStreamBufferBytesAvailable(s_stream) == 0);
+          bool usbIdle     = s_lastUsbWriteMs != 0 &&
+                             (now - s_lastUsbWriteMs) >= 5000;
+          bool hasData     = s_lastJobBytes > 0;
+
+          if (streamEmpty && usbIdle && hasData && !s_syntheticInjected)
+          {
+            static const char kSyntheticStatus[] =
+              "\r\n@PJL USTATUS JOB\r\nEND\r\nNAME=\"job\"\r\nPAGES=1\r\n\x0c"
+              "@PJL INFO STATUS\r\nCODE=10001\r\n"
+              "DISPLAY=\"Ready\"\r\nONLINE=TRUE\r\n";
+
+            ssize_t w = ::send(cfd, kSyntheticStatus,
+                               sizeof(kSyntheticStatus) - 1, MSG_DONTWAIT);
+            s_syntheticInjected = true;
+            logTee("[raw9100] injected synthetic Ready+JobEnd (%d bytes)\n", (int)w);
+
+            // After injection, wait 5s for CUPS to process, then force close
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            closeReason = JCR_JOB_COMPLETE;
+            logTeeln("[raw9100] post-injection timeout, closing");
+            break;
+          }
+
+          // Hard idle timeout (120s - generous for slow renderers)
+          if (now - s_lastRecvActivityMs >= 120000)
+          {
+            logTeeln("[raw9100] idle timeout (120s), closing");
+            closeReason = JCR_IDLE_TIMEOUT;
+            break;
+          }
+          continue;
         }
         logTee("[raw9100] recv errno=%d, closing\n", errno);
         closeReason = JCR_OTHER;
         break;
       }
     }
-
-    ::close(cfd);
 
     // Drain phase: we need to wait for the USB writer task to actually
     // finish pushing every queued byte to the printer, not just for the
@@ -1075,9 +1300,9 @@ static void rawServerTask(void *arg)
         lastOutSeen     = s_totalBytesOut;
         lastOutChangeMs = now;
       }
-      // Quiescent: stream empty AND USB writer hasn't bumped the counter
-      // for 200 ms.
-      if (streamEmpty && (now - lastOutChangeMs) >= 200)
+      bool usbQuiescent = streamEmpty && (now - lastOutChangeMs) >= kDrainQuiescentMs;
+      bool jobDoneSignal = s_jobComplete && (now - s_jobCompleteMs) >= kJobCompleteQuietMs;
+      if (closeReason == JCR_JOB_COMPLETE || jobDoneSignal || usbQuiescent)
       {
         break;
       }
@@ -1091,7 +1316,84 @@ static void rawServerTask(void *arg)
         logTeeln("[raw9100] printer disappeared during drain");
         break;
       }
+      if (s_usbConsecutiveErrors >= kMaxConsecutiveUsbErrors)
+      {
+        logTeeln("[raw9100] USB stuck during drain, aborting");
+        break;
+      }
       vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    logTeeln("[raw9100] drain complete");
+
+#if ENABLE_SYNTHETIC_READY
+    // ---------------------------------------------------------------
+    // After USB drain, inject a synthetic "Ready" PJL status into the
+    // TCP back-channel.  The HP rastertozjs CUPS filter's readThread
+    // parses Bulk IN data for PJL USTATUS/INFO STATUS messages.  If
+    // the printer sent CODE=41102 ("Manual Feed") at job start, the
+    // filter sets CUPS state "media-needed-error" and won't clear it
+    // until a new status (like CODE=10001 "Ready") arrives.  On this
+    // printer, the Bulk IN endpoint often doesn't deliver a post-job
+    // status update in time (or at all).  Sending a synthetic status
+    // unblocks the CUPS filter so the backend can finish.
+    // ---------------------------------------------------------------
+    {
+      // HP PJL INFO STATUS format that rastertozjs understands:
+      static const char kReadyStatus[] =
+        "@PJL INFO STATUS\r\nCODE=10001\r\nDISPLAY=\"Ready\"\r\nONLINE=TRUE\r\n\x1b%-12345X";
+      int fd = s_rawClientFd;
+      if (fd >= 0)
+      {
+        ssize_t w = ::send(fd, kReadyStatus, sizeof(kReadyStatus) - 1, MSG_DONTWAIT);
+        logTee("[raw9100] injected synthetic Ready status (%d bytes sent)\n", (int)w);
+      }
+      // Give CUPS readThread time to parse the status and clear the
+      // media-needed-error state before we close the socket.
+      vTaskDelay(pdMS_TO_TICKS(kSyntheticStatusDelayMs));
+    }
+#endif
+
+    logTeeln("[raw9100] sending FIN");
+    ::shutdown(cfd, SHUT_WR);
+
+    uint32_t finStart = millis();
+    bool peerClosed = false;
+    for (;;)
+    {
+      uint8_t scratch[128];
+      ssize_t r = ::recv(cfd, scratch, sizeof(scratch), MSG_DONTWAIT);
+      if (r == 0)
+      {
+        peerClosed = true;
+        logTee("[raw9100] peer closed %u ms after FIN\n",
+                      (unsigned)(millis() - finStart));
+        break;
+      }
+      if (r > 0)
+      {
+        continue;
+      }
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        if (millis() - finStart >= kFinWaitMs)
+        {
+          logTeeln("[raw9100] FIN wait timeout, forcing close");
+          break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+        continue;
+      }
+      logTee("[raw9100] recv during FIN errno=%d\n", errno);
+      break;
+    }
+
+    s_rawClientFd = -1;
+    ::close(cfd);
+
+    if (!peerClosed)
+    {
+      logTeeln("[raw9100] peer did not close before timeout");
     }
 
     // Now the per-job byte counters are accurate.
@@ -1113,6 +1415,7 @@ static void rawServerTask(void *arg)
     // Finalise the JobRecord after USB drain so bytes_out / usb counters
     // reflect the actual outcome, not just the TCP-side state.
     jobEnd(closeReason);
+    s_jobComplete = false;
   }
 }
 
@@ -1624,6 +1927,7 @@ static void startMdns()
 static void startUsbHost()
 {
   s_usb.lock = xSemaphoreCreateMutex();
+  s_usbSubmitMux = xSemaphoreCreateMutex();
 
   usb_host_config_t cfg = {};
   cfg.skip_phy_setup = false;
@@ -1643,7 +1947,12 @@ static void startUsbHost()
   // Writer task on core 0, priority 4
   xTaskCreatePinnedToCore(usbWriterTask, "usb-out", 4096, nullptr, 4, nullptr, 0);
   // Reader task on core 0, priority 3 (lower than writer)
+  // Reader task MUST be lower priority than usb-cli (4) so that the USB
+  // client event loop can dispatch control-transfer callbacks during device
+  // attach.  Same-priority round-robin on core 0 starves handle_events.
   xTaskCreatePinnedToCore(usbReaderTask, "usb-in",  4096, nullptr, 3, nullptr, 0);
+  // Back-channel forwarder on core 1
+  xTaskCreatePinnedToCore(backFwdTask, "back-fwd", 4096, nullptr, 3, nullptr, 1);
 }
 
 // Allocate the stream buffer storage in PSRAM if available.
@@ -1659,7 +1968,32 @@ static bool createStreamBuffer()
   if (!s_streamStorage) return false;
 
   s_stream = xStreamBufferCreateStatic(kStreamBufBytes, 1, s_streamStorage, &s_streamCb);
-  return s_stream != nullptr;
+  if (!s_stream) return false;
+
+  // Back-channel ring buffer for printer→host status forwarding
+  s_backBufStorage = (uint8_t *)heap_caps_malloc(kBackBufBytes + 1, MALLOC_CAP_SPIRAM);
+  if (!s_backBufStorage)
+  {
+    s_backBufStorage = (uint8_t *)heap_caps_malloc(kBackBufBytes + 1, MALLOC_CAP_8BIT);
+  }
+  if (s_backBufStorage)
+  {
+    s_backBuf = xStreamBufferCreateStatic(kBackBufBytes, 1, s_backBufStorage, &s_backBufCb);
+    if (s_backBuf)
+    {
+      logTee("Back-channel buffer: %u bytes\n", (unsigned)kBackBufBytes);
+    }
+    else
+    {
+      logTeeln("Back-channel buffer create failed (disabled)");
+    }
+  }
+  else
+  {
+    logTeeln("Back-channel buffer alloc failed (disabled)");
+  }
+
+  return true;
 }
 
 void setup()
