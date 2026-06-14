@@ -83,7 +83,9 @@ JZJZ ...                         ← ZJStream magic
 ├── platformio.ini              # 板子/USB/PSRAM/分区配置
 ├── sdkconfig.defaults          # USB Host / PSRAM / FreeRTOS / 日志路由
 ├── sdkconfig.esp32-s3-n16r8    # 由 PlatformIO 生成（首次 build 后产生）
-├── huge_app.csv                # 16MB Flash 分区表（6.25MB app + 9.5MB SPIFFS）
+├── sdkconfig.esp32-s3-n16r8-ota # OTA 环境由 PlatformIO 生成
+├── ota_16mb.csv                # 16MB Flash 双 OTA 分区表（2x5MB app + SPIFFS）
+├── scripts/version.py          # 构建时注入 Git 版本和构建时间
 ├── include/
 │   ├── secrets.example.h       # Wi-Fi/mDNS 模板（提交到 git）
 │   └── secrets.h               # 你的实际凭据（**不提交**，已在 .gitignore）
@@ -392,6 +394,73 @@ close_reason = job_complete
 
 ---
 
+## OTA 升级
+
+固件启用了 ArduinoOTA，后续可以通过 Wi-Fi 上传新固件，不必每次插 USB-Serial-JTAG。首次启用 OTA 时仍必须用 USB 串口烧录一次，因为分区表需要从单 app 切换到双 OTA app 槽。
+
+### 1. 配置 OTA 密码
+
+在本地 `include/secrets.h` 中设置密码，不要提交真实密码：
+
+```cpp
+#define OTA_PASSWORD "your-strong-password"
+```
+
+VS Code / PlatformIO 上传时使用同一个密码。
+
+### 2. 首次串口烧录
+
+首次切换到 OTA 分区表时执行：
+
+```bash
+"/Users/donny/.platformio/penv/bin/pio" run -e esp32-s3-n16r8 -t upload
+```
+
+如果自动识别串口失败，先用 `pio device list` 找到 USB-Serial-JTAG 端口，再指定 `--upload-port`。
+
+### 3. 后续命令行 OTA
+
+```bash
+ESP32_OTA_PASSWORD='your-strong-password' \
+  "/Users/donny/.platformio/penv/bin/pio" run -e esp32-s3-n16r8-ota -t upload
+```
+
+OTA 目标默认是：
+
+```text
+esp32-printer.local
+```
+
+### 4. VS Code 一键 OTA
+
+仓库提供 `.vscode/tasks.json`，在 VS Code 中运行：
+
+```text
+Terminal -> Run Task -> PlatformIO: OTA Upload
+```
+
+VS Code 会弹窗输入 OTA 密码，并通过环境变量 `ESP32_OTA_PASSWORD` 传给 PlatformIO，不会把密码写入仓库。
+
+OTA 期间不要打印，保持 ESP32 和电脑在同一 Wi-Fi/VLAN。失败时通常会继续运行旧固件；如果分区表或启动异常，用 USB 串口重新烧录恢复。
+
+### 5. 确认 OTA 是否成功
+
+状态页会显示自动注入的固件版本信息：
+
+```text
+Firmware: <git describe>-dirty (git <short-sha>, dirty, built YYYY-MM-DD HH:MM:SS)
+```
+
+其中：
+- `FW_VERSION` 来自 `git describe --tags --always`，工作区有未提交改动时追加 `-dirty`
+- `FW_GIT_REV` 是当前短 commit
+- `FW_GIT_DIRTY` 是 `clean` / `dirty`
+- `FW_BUILD_TIME` 是本次构建时间
+
+OTA 完成后打开 `http://esp32-printer.local/`，确认 `Firmware` 行的 Git 或构建时间变化即可判断升级成功。
+
+---
+
 ## 配置参考
 
 ### `platformio.ini` 要点
@@ -400,7 +469,8 @@ close_reason = job_complete
 |---|---|---|
 | `board` | `esp32-s3-devkitc-1` | 标准 S3 DevKitC |
 | `board_upload.flash_size` | `16MB` | 适配 N16R8 |
-| `board_build.partitions` | `huge_app.csv` | 自定义 6.25MB app + 9.5MB SPIFFS |
+| `board_build.partitions` | `ota_16mb.csv` | 双 OTA app 槽，每槽 5MB |
+| `extra_scripts` | `pre:scripts/version.py` | 构建前注入 Git 版本、dirty 状态和构建时间 |
 | `board_build.arduino.memory_type` | `qio_opi` | Flash QIO + PSRAM Octal |
 | `board_build.psram_type` | `opi` | 8MB Octal PSRAM |
 | `-DARDUINO_USB_MODE=0` (build_flags) | | 禁用 Arduino USB 接管 OTG PHY |
@@ -421,13 +491,14 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=15         # 兼容长 USB 传输
 CONFIG_AUTOSTART_ARDUINO=y               # Arduino 作为 IDF 组件
 ```
 
-### `huge_app.csv` 分区表（16MB Flash）
+### `ota_16mb.csv` 分区表（16MB Flash）
 
 ```
 nvs       0x9000     20K
 otadata   0xE000     8K
-app0      0x10000    6.25MB     ← 单 app 槽，不支持 OTA
-spiffs    0x650000   9.5MB
+app0      0x10000    5MB        ← OTA slot 0
+app1      0x510000   5MB        ← OTA slot 1
+spiffs    0xA10000   5.875MB
 coredump  0xFF0000   64K
 ```
 
@@ -446,7 +517,7 @@ coredump  0xFF0000   64K
 | 7 | `printer not ready` 时丢弃数据 | 未修复 | 改为阻塞等待或 TCP 层拒绝 |
 | 8 | 控制传输跨任务调用 | 未修复 | HTTP `/reset` 应通过 queue 送到 client task |
 | 9 | Wi-Fi 重连后 mDNS 不重启 | 未修复 | 监听 WiFi event 自动重启 mDNS |
-| 10 | 没有 OTA | 未修复 | 长期使用建议改 dual OTA 分区表 |
+| 10 | 没有 OTA | **已修复** | 使用 `ota_16mb.csv` 双 OTA 分区表 + ArduinoOTA |
 | 11 | macOS HP PPD 默认手动进纸 | **已修复** | `esp32_printer` 队列 PPD 增加 `InputSlot Auto` 并设为默认，避免打印机闪灯等待手动进纸 |
 
 ---

@@ -48,6 +48,8 @@
 #include "http_status.h"
 #include "log_sink.h"
 #include "job_log.h"
+#include "ota_update.h"
+#include "version.h"
 
 // -----------------------------------------------------------------------------
 // Back-channel ring buffer: printer Bulk IN → this buffer → TCP client.
@@ -204,6 +206,8 @@ void setup()
 
   logTeeNewline();
   logTeeln("=== ESP32-S3-N16R8 USB Print Bridge ===");
+  logTee("Firmware: %s (git %s, %s, built %s)\n",
+         FW_VERSION, FW_GIT_REV, FW_GIT_DIRTY, FW_BUILD_TIME);
   logTee("PSRAM total: %u  free: %u\n",
                 (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM),
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -217,6 +221,7 @@ void setup()
 
   startWifi();
   startMdns();
+  otaInit();
 
   webServer.on("/", handleRoot);
   webServer.on("/reset", handleReset);
@@ -243,5 +248,6 @@ void setup()
 void loop()
 {
   webServer.handleClient();
+  otaHandle();
   delay(2);
 }

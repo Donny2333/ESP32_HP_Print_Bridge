@@ -21,6 +21,8 @@
 #include "usb_bridge.h"   // usbCtrlSoftReset
 #include "log_sink.h"
 #include "job_log.h"
+#include "ota_update.h"
+#include "version.h"
 
 WebServer webServer(80);
 
@@ -75,7 +77,16 @@ void handleRoot()
   html += "<p>Bridge to HP LaserJet M1136 over USB &mdash; clients print via TCP <code>:9100</code>.</p>";
   html += "<table>";
   html += "<tr><td>Wi-Fi</td><td>" + WiFi.localIP().toString() + " (" + macToString() + ")</td></tr>";
+  html += "<tr><td>Firmware</td><td>" + String(FW_VERSION) +
+          " (git " + String(FW_GIT_REV) + ", " + String(FW_GIT_DIRTY) +
+          ", built " + String(FW_BUILD_TIME) + ")</td></tr>";
   html += "<tr><td>mDNS</td><td><code>" + String(kMdnsHostname) + ".local</code></td></tr>";
+  html += "<tr><td>OTA</td><td>" + String(otaStatusText());
+  if (otaInProgress())
+  {
+    html += " (" + String((unsigned)otaProgressPercent()) + "%)";
+  }
+  html += "</td></tr>";
   html += "<tr><td>Printer</td><td><span class='";
   html += s_printerReady ? "ok'>READY" : "bad'>not connected";
   html += "</span></td></tr>";
