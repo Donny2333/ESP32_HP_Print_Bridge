@@ -31,10 +31,6 @@
 // Module-private USB transfer state (used only within this file).
 // -----------------------------------------------------------------------------
 
-// Pre-allocated persistent USB OUT transfer (avoid per-chunk alloc/free)
-static usb_transfer_t  *s_outXfer = nullptr;
-static SemaphoreHandle_t s_outDone = nullptr;
-
 // Bulk IN endpoint error streak counter for auto-recovery
 static volatile uint32_t s_inErrorStreak = 0;
 
@@ -347,8 +343,17 @@ static bool usbTryAttachDevice(uint8_t devAddr)
            didErr);
   }
 
+  s_portStatus = kPortStatusUnknown;
   uint8_t st = 0;
   esp_err_t psErr = usbCtrlGetPortStatus(&st);
+  if (psErr != ESP_OK || (st & 0x08) == 0)
+  {
+    logTee("[usb-cli] GET_PORT_STATUS first try err=0x%x st=0x%02X, retrying after 500ms\n",
+           psErr, st);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    st = 0;
+    psErr = usbCtrlGetPortStatus(&st);
+  }
   if (psErr == ESP_OK)
   {
     s_portStatus = st;
@@ -356,6 +361,7 @@ static bool usbTryAttachDevice(uint8_t devAddr)
   }
   else
   {
+    s_portStatus = kPortStatusUnknown;
     logTee("[usb-cli] GET_PORT_STATUS failed err=0x%x\n", psErr);
   }
 
@@ -363,20 +369,10 @@ static bool usbTryAttachDevice(uint8_t devAddr)
   s_printerReady = true;
   logTeeln("[usb-cli] printer attached and ready");
 
-  // Pre-allocate persistent Bulk OUT transfer
-  if (s_outXfer == nullptr)
-  {
-    if (usb_host_transfer_alloc(kUsbChunkBytes, 0, &s_outXfer) == ESP_OK)
-    {
-      s_outDone = xSemaphoreCreateBinary();
-      logTeeln("[usb-cli] pre-allocated OUT transfer");
-    }
-    else
-    {
-      logTeeln("[usb-cli] WARN: OUT transfer pre-alloc failed, will use per-call alloc");
-      s_outXfer = nullptr;
-    }
-  }
+  // Keep Bulk OUT on the per-call alloc/free path.  Reusing a persistent
+  // transfer can leave ESP-IDF v4.4 thinking the object is still in-flight
+  // after large AirPrint/photo jobs, causing submit to return 0x10c forever.
+  logTeeln("[usb-cli] OUT transfer reuse disabled, using per-call alloc");
 
   s_inErrorStreak = 0;
 
@@ -405,17 +401,6 @@ void usbDetach()
   s_usb.epIn     = 0;
   s_usb.epOutMps = 0;
   s_usb.epInMps  = 0;
-  // Free persistent transfers
-  if (s_outXfer)
-  {
-    usb_host_transfer_free(s_outXfer);
-    s_outXfer = nullptr;
-  }
-  if (s_outDone)
-  {
-    vSemaphoreDelete(s_outDone);
-    s_outDone = nullptr;
-  }
   s_printerReady = false;
   s_deviceId[0]  = '\0';
   s_portStatus   = kPortStatusUnknown;
@@ -691,48 +676,7 @@ void usbWriterTask(void *arg)
 
       esp_err_t err;
 
-      // Use persistent transfer if available, else fallback to alloc
-      if (s_outXfer && s_outDone)
-      {
-        memcpy(s_outXfer->data_buffer, chunk + off, n);
-        s_outXfer->num_bytes        = n;
-        s_outXfer->device_handle    = s_usb.device;
-        s_outXfer->bEndpointAddress = s_usb.epOut;
-        s_outXfer->callback         = writeXferCb;
-        s_outXfer->context          = nullptr;  // use global semaphore
-        s_outXfer->timeout_ms       = 8000;
-
-        // writeXferCb needs to give s_outDone
-        // We'll reuse WriteCtx pattern with the persistent semaphore
-        WriteCtx outCtx = {};
-        outCtx.done = s_outDone;
-        s_outXfer->context = &outCtx;
-
-        xSemaphoreTake(s_usbSubmitMux, portMAX_DELAY);
-        err = usb_host_transfer_submit(s_outXfer);
-        xSemaphoreGive(s_usbSubmitMux);
-        if (err == ESP_OK)
-        {
-          if (xSemaphoreTake(s_outDone, pdMS_TO_TICKS(8200)) != pdTRUE)
-          {
-            logTeeln("[usb-out] transfer timeout (semaphore)");
-            err = ESP_ERR_TIMEOUT;
-          }
-          else
-          {
-            err = outCtx.status;
-          }
-        }
-        else
-        {
-          logTee("[usb-out] submit err=0x%x\n", err);
-        }
-      }
-      else
-      {
-        // Fallback: per-call alloc (original path)
-        err = usbBulkOutSync(chunk + off, n, 8000);
-      }
+      err = usbBulkOutSync(chunk + off, n, 8000);
 
       if (err != ESP_OK)
       {

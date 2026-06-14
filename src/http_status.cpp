@@ -56,6 +56,15 @@ static String portStatusDescr(uint8_t st)
 
 void handleRoot()
 {
+  if (s_printerReady && s_portStatus == kPortStatusUnknown)
+  {
+    uint8_t st = 0;
+    if (usbCtrlGetPortStatus(&st) == ESP_OK)
+    {
+      s_portStatus = st;
+    }
+  }
+
   String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   html += "<title>ESP32 USB Print Bridge</title>";
   html += "<style>body{font-family:-apple-system,sans-serif;max-width:720px;margin:2em auto;padding:0 1em;color:#222}";

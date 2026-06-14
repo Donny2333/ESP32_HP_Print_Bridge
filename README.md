@@ -205,7 +205,9 @@ pio device monitor
 - 协议：**HP JetDirect — Socket**
 - 地址：`esp32-printer.local`（或日志里打印的 IP）
 - 驱动："**HP LaserJet Professional M1130 MFP Series**"
-- 名称随意
+- 名称建议：`airprint4esp32`（后续 AirPrint 广播示例使用这个队列名）
+- 默认纸张：**A4**
+- 默认进纸：**Auto**（不要让 PPD 强制 `Manual Feed`，否则打印机会闪灯等待手动进纸）
 
 ### 5. 打印
 
@@ -226,6 +228,166 @@ pio device monitor
 - 累计字节 / 当前任务字节
 - 内存占用
 - `/reset` 软复位打印机端口
+
+---
+
+## macOS 共享与 AirPrint 配置
+
+ESP32 固件只提供 TCP `:9100` 原始打印通道，不实现 IPP/AirPrint，也不做 PDF/PWG-Raster 到 ZJStream 的转换。iPhone/iPad 打印需要 Mac 做中转：iOS 通过 AirPrint/IPP 把作业交给 Mac，Mac 的 HP 驱动把作业转换成 M1136 能识别的 `PJL + ZJStream`，再通过 `socket://esp32-printer.local/` 发给 ESP32。
+
+### 1. CUPS 队列要求
+
+macOS 上需要有一个共享打印队列，例如 `airprint4esp32`：
+
+```bash
+lpstat -v airprint4esp32
+lpoptions -p airprint4esp32
+```
+
+期望看到：
+
+```text
+device-uri=socket://esp32-printer.local/
+printer-make-and-model='HP LaserJet Professional M1130 MFP Series, 1.8'
+printer-is-shared=true
+```
+
+这个队列必须保持共享开启。自定义 AirPrint 广播只是让 iPhone 能发现打印机，真正提交打印时仍然访问 Mac CUPS 的 `printers/airprint4esp32`。
+
+### 2. 修正 HP PPD 的手动进纸默认值
+
+HP M1130/M1136 的 macOS PPD 可能默认只有 `Manual Feed in Tray 1`：
+
+```text
+*DefaultInputSlot: Manual
+*InputSlot Manual/Manual Feed in Tray 1: "<</MediaPosition 4>>setpagedevice"
+```
+
+这种配置会让 iPhone/Android 作业完整送到打印机后，打印机闪错误灯并等待手动进纸。修正方式是给 PPD 增加一个不强制 `MediaPosition` 的 `Auto` 进纸，并设为默认：
+
+```text
+*DefaultInputSlot: Auto
+*InputSlot Auto/Auto Select: ""
+*InputSlot Manual/Manual Feed in Tray 1: "<</MediaPosition 4>>setpagedevice"
+```
+
+可用下面命令生成修正 PPD 并应用到队列：
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+src = Path('/private/etc/cups/ppd/airprint4esp32.ppd')
+dst = Path('/tmp/airprint4esp32-auto.ppd')
+text = src.read_text()
+text = text.replace('*DefaultInputSlot: Manual', '*DefaultInputSlot: Auto')
+text = text.replace('*InputSlot Manual/Manual Feed in Tray 1: "<</MediaPosition 4>>setpagedevice"', '*InputSlot Auto/Auto Select: ""\n*InputSlot Manual/Manual Feed in Tray 1: "<</MediaPosition 4>>setpagedevice"')
+dst.write_text(text)
+print(dst)
+PY
+
+lpadmin -p airprint4esp32 -P /tmp/airprint4esp32-auto.ppd -o PageSize=A4 -o InputSlot=Auto
+```
+
+验证：
+
+```bash
+lpoptions -p airprint4esp32 -l
+```
+
+期望看到：
+
+```text
+PageSize/Media Size: Letter Legal *A4 ...
+InputSlot/Media Source: *Auto Manual
+```
+
+### 3. 发布 iPhone 可发现的 AirPrint 广播
+
+macOS 自带共享有时只发布普通 `_ipp._tcp` / `_ipps._tcp`，iPhone 原生打印界面可能搜不到。可以额外用 `dns-sd` 注册一个 `_ipp._tcp,_universal` AirPrint 服务，指向同一个 CUPS 队列。
+
+创建 `~/Library/LaunchAgents/com.donny.airprint-esp32.plist`：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.donny.airprint-esp32</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/dns-sd</string>
+    <string>-R</string>
+    <string>ESP32 HP M1136</string>
+    <string>_ipp._tcp,_universal</string>
+    <string>local</string>
+    <string>631</string>
+    <string>txtvers=1</string>
+    <string>qtotal=1</string>
+    <string>rp=printers/airprint4esp32</string>
+    <string>ty=HP LaserJet Professional M1130 MFP Series</string>
+    <string>note=Shared via Mac to ESP32 USB bridge</string>
+    <string>product=(HP LaserJet Professional M1139 MFP)</string>
+    <string>pdl=application/pdf,image/jpeg,image/png,image/pwg-raster,image/urf</string>
+    <string>URF=CP1,RS600,W8,SRGB24,IS1-4,MT1-2</string>
+    <string>Color=F</string>
+    <string>Duplex=F</string>
+    <string>Copies=T</string>
+    <string>printer-state=3</string>
+    <string>printer-type=0x809056</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/com.donny.airprint-esp32.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/com.donny.airprint-esp32.err</string>
+</dict>
+</plist>
+```
+
+加载并设为登录自动启动：
+
+```bash
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.donny.airprint-esp32.plist" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.donny.airprint-esp32.plist"
+launchctl enable "gui/$(id -u)/com.donny.airprint-esp32"
+launchctl kickstart -k "gui/$(id -u)/com.donny.airprint-esp32"
+```
+
+验证：
+
+```bash
+launchctl print "gui/$(id -u)/com.donny.airprint-esp32"
+dns-sd -B _ipp._tcp,_universal local
+dns-sd -L "ESP32 HP M1136" _ipp._tcp local
+ippfind
+```
+
+期望 iPhone 打印界面能看到 `ESP32 HP M1136`。
+
+### 4. iPhone 打印链路
+
+正常链路如下：
+
+```text
+iPhone AirPrint
+  -> Mac CUPS / HP rastertozjs
+  -> ESP32 raw9100
+  -> USB Bulk OUT
+  -> HP M1136
+```
+
+ESP32 `/jobs` 里成功任务应满足：
+
+```text
+sig = HP_UEL_PJL_ZJS
+bytes_in == bytes_out
+usb_err_count = 0
+close_reason = job_complete
+```
 
 ---
 
@@ -274,7 +436,7 @@ coredump  0xFF0000   64K
 
 | # | 问题 | 状态 | 说明 |
 |---|---|---|---|
-| 1 | bulk OUT 每次 alloc | **已修复** | 持久化 `s_outXfer`，writer 任务复用 |
+| 1 | bulk OUT transfer 复用触发 `0x10c` | **已规避** | 当前使用 per-call alloc/free；持久化 `s_outXfer` 在大图/AirPrint 作业后会卡住 |
 | 2 | Bulk IN 与 OUT 并发导致 ESP32 重启 | **已规避** | 禁用 Bulk IN polling（详见下文） |
 | 3 | `wIndex` 编码错误 | **已修复** | `GET_PORT_STATUS` / `SOFT_RESET` 已正确左移 8 位 |
 | 4 | 打印队列永不结束 | **已修复** | 合成 PJL `USTATUS JOB END` 注入（详见下文） |
@@ -284,6 +446,7 @@ coredump  0xFF0000   64K
 | 8 | 控制传输跨任务调用 | 未修复 | HTTP `/reset` 应通过 queue 送到 client task |
 | 9 | Wi-Fi 重连后 mDNS 不重启 | 未修复 | 监听 WiFi event 自动重启 mDNS |
 | 10 | 没有 OTA | 未修复 | 长期使用建议改 dual OTA 分区表 |
+| 11 | macOS HP PPD 默认手动进纸 | **已修复** | `airprint4esp32` 队列 PPD 增加 `InputSlot Auto` 并设为默认，避免打印机闪灯等待手动进纸 |
 
 ---
 
@@ -407,7 +570,7 @@ USB 控制传输（`GET_DEVICE_ID`、`GET_PORT_STATUS`）的完成回调需要 `
  │     → TCP 根本没连上，看 / 状态页 Wi-Fi / IP / mDNS
  │
  ├─ sig=HP_UEL_PJL_ZJS
- │     ├─ in==out 且 usb_err=0   → 打印机收齐了不出纸（硬件/驱动器/PPD 在 PJL 之外的问题）
+ │     ├─ in==out 且 usb_err=0   → 打印机收齐了；若闪灯看 Port Status / InputSlot
  │     ├─ bytes_dropped > 0      → "printer not ready" 期间被丢；看实时日志找原因
  │     └─ usb_err_count > 0      → USB 段卡，看 last_usb_err（0x103=TIMEOUT 0x108=STALL）
  │
@@ -451,6 +614,28 @@ USB 控制传输（`GET_DEVICE_ID`、`GET_PORT_STATUS`）的完成回调需要 `
 2. 用 macOS 本地抓包（参见顶部"前置条件"段），确认头部是 `1B 25 2D 31 32 33 34 35 58` + `@PJL ENTER LANGUAGE=ZJS`
 3. 如果抓包发现是 PostScript / PWG-Raster → **驱动问题**，不是 ESP32 问题
 
+### iPhone 搜不到 `ESP32 HP M1136`
+- 确认 Mac 上 AirPrint 广播服务正在运行：
+  ```bash
+  launchctl print "gui/$(id -u)/com.donny.airprint-esp32"
+  ```
+- 确认 Bonjour 能看到 `_universal` 服务：
+  ```bash
+  dns-sd -B _ipp._tcp,_universal local
+  ```
+- 如果 Mac 能看到但 iPhone 看不到，确认 iPhone 和 Mac 在同一 Wi-Fi/VLAN，路由器没有开启 AP Isolation / Client Isolation。
+- 关闭再打开 iPhone Wi-Fi，或退出打印界面重进；Bonjour 有缓存延迟。
+
+### iPhone 能打印但打印机闪灯不出纸
+- 先看 ESP32 `/jobs`：若 `sig=HP_UEL_PJL_ZJS`、`bytes_in==bytes_out`、`usb_err_count=0`，说明数据和 USB 链路正常。
+- 打开 ESP32 状态页；若 `Port status` 显示 `PAPER EMPTY`，通常是打印机等待纸张/进纸。
+- 检查 Mac 队列是否仍强制手动进纸：
+  ```bash
+  lpoptions -p airprint4esp32 -l
+  ```
+- 期望 `InputSlot/Media Source` 为 `*Auto Manual`；如果只有 `*Manual`，按“macOS 共享与 AirPrint 配置”里的 PPD 修正步骤处理。
+- 临时验证方法：在手动进纸口放一张 A4 并按继续/OK；如果能打印，说明就是 `Manual Feed` 配置问题。
+
 ### `Port status = 0x00`
 - 大概率是上面已知问题 #3 导致的误诊断，不一定真离线
 
@@ -474,11 +659,11 @@ USB 控制传输（`GET_DEVICE_ID`、`GET_PORT_STATUS`）的完成回调需要 `
 - 延长 / 缩短 transfer timeout
 - 每次 alloc 全新 transfer（排除 reuse 问题）
 
-### 3. Bulk IN `usb_host_transfer_submit` 返回 0x10c (ESP_ERR_NOT_ALLOWED)
+### 3. 复用 USB transfer 时 `usb_host_transfer_submit` 返回 0x10c (ESP_ERR_NOT_ALLOWED)
 
-**现象**：使用持久化 transfer 对象（预分配不释放）时，submit 返回 `ESP_ERR_NOT_ALLOWED`。
+**现象**：使用持久化 transfer 对象（预分配不释放）时，submit 返回 `ESP_ERR_NOT_ALLOWED`。Bulk OUT 在大图 / AirPrint 照片作业后也观察到同类卡死。
 **原因**：driver 认为该 transfer 仍处于 in-flight 状态（前一次的 callback 可能未被 dispatch）。
-**规避方式**：改为 per-call alloc/free 模型（每次提交新对象）。
+**规避方式**：Bulk OUT 当前也改为 per-call alloc/free 模型（每次提交新对象），避免复用 `s_outXfer`。
 
 ### 4. Control transfer callback 需要 handle_events 驱动
 
