@@ -219,7 +219,7 @@ void rawServerTask(void *arg)
           // -------------------------------------------------------
           bool streamEmpty = (xStreamBufferBytesAvailable(s_stream) == 0);
           bool usbIdle     = s_lastUsbWriteMs != 0 &&
-                             (now - s_lastUsbWriteMs) >= 2000;
+                             (now - s_lastUsbWriteMs) >= 8000;
           bool hasData     = s_lastJobBytes > 0;
 
           if (streamEmpty && usbIdle && hasData && !s_syntheticInjected)
@@ -456,9 +456,7 @@ void tcpLogTask(void *arg)
         {
           // Slow / dead client: drop it.
           logTee("[log9101] viewer dropped errno=%d\n", errno);
-    // Stop the back-channel from writing to a closing fd, then close.
-    s_rawClientFd = -1;
-    ::close(cfd);
+          ::close(cfd);
           cfd = -1;
         }
       }
