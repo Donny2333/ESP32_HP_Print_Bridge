@@ -68,8 +68,11 @@ static StaticStreamBuffer_t  s_streamCb;
 // Wi-Fi / mDNS / USB host bring-up
 // -----------------------------------------------------------------------------
 
+static void wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info);
+
 static void startWifi()
 {
+  WiFi.onEvent(wifiEventHandler);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);     // better USB Host stability under WiFi traffic
   WiFi.begin(kSsid, kPassword);
@@ -93,14 +96,24 @@ static void startWifi()
                 WiFi.localIP().toString().c_str(), macToString().c_str());
 }
 
+static bool s_mdnsStarted = false;
+
 static void startMdns()
 {
+  if (s_mdnsStarted)
+  {
+    MDNS.end();
+    s_mdnsStarted = false;
+  }
+
   if (!MDNS.begin(kMdnsHostname))
   {
     logTeeln("mDNS begin failed");
     return;
   }
   logTee("mDNS: %s.local\n", kMdnsHostname);
+
+  s_mdnsStarted = true;
 
   // Advertise as a JetDirect / pdl-datastream printer.
   MDNS.addService("pdl-datastream", "tcp", kRawPort);
@@ -119,6 +132,22 @@ static void startMdns()
 
   // HTTP admin
   MDNS.addService("http", "tcp", 80);
+}
+
+static void wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+  switch (event)
+  {
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      logTee("[wifi] got ip: %s\n", WiFi.localIP().toString().c_str());
+      startMdns();
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      logTeeln("[wifi] disconnected, waiting for reconnect...");
+      break;
+    default:
+      break;
+  }
 }
 
 static void startUsbHost()

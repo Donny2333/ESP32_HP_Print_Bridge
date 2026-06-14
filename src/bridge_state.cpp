@@ -10,6 +10,12 @@
 
 #include "bridge_config.h"   // kPortStatusUnknown
 
+const char * const kSsid         = WIFI_SSID;
+const char * const kPassword     = WIFI_PASSWORD;
+const char * const kMdnsHostname = MDNS_HOSTNAME;
+const char * const kPrinterName  = PRINTER_FRIENDLY_NAME;
+const uint16_t       kRawPort    = 9100;
+
 UsbState s_usb = {};
 
 SemaphoreHandle_t   s_usbSubmitMux = nullptr;
