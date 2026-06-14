@@ -13,3 +13,6 @@
 
 // Friendly name advertised over mDNS / shown on the status page
 #define PRINTER_FRIENDLY_NAME "ESP32 USB Bridge to HP M1136"
+
+// ArduinoOTA password. Keep the real value only in include/secrets.h.
+#define OTA_PASSWORD "change-me"
