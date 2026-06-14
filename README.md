@@ -514,16 +514,16 @@ coredump  0xFF0000   64K
 | 4 | 打印队列永不结束 | **已修复** | 合成 PJL `USTATUS JOB END` 注入（详见下文） |
 | 5 | TCP idle 超时过短 | **已修复** | `SO_RCVTIMEO=2s` + 120s 兜底 |
 | 6 | ZJS 签名误报 `PJL_NO_ZJS` | **已修复** | 扫描 incoming chunk 直接检测 ZJS token |
-| 7 | `printer not ready` 时丢弃数据 | 未修复 | 改为阻塞等待或 TCP 层拒绝 |
+| 7 | `printer not ready` 时丢弃数据 | **已修复** | 改为阻塞等待，超时则直接切断 TCP 让对端感知失败重试 |
 | 8 | 控制传输跨任务并发 | **已修复** | 新增 `s_usbControlMux` 全局互斥锁，彻底串行化 `GET_PORT_STATUS`、`SOFT_RESET` 和 attach 阶段的控制端点请求，防止驱动死锁 |
 | 9 | Wi-Fi 重连后 mDNS 不重启 | 未修复 | 监听 WiFi event 自动重启 mDNS |
 | 10 | 没有 OTA | **已修复** | 使用 `ota_16mb.csv` 双 OTA 分区表 + ArduinoOTA |
 | 11 | macOS HP PPD 默认手动进纸 | **已修复** | `esp32_printer` 队列 PPD 增加 `InputSlot Auto` 并设为默认，避免打印机闪灯等待手动进纸 |
 | 12 | Bulk OUT 超时后 Use-After-Free | **已修复** | `usbBulkOutSync` 超时不再立刻 free，强制执行 `halt` 和 `flush` 终结 in-flight 状态，安全吸收回调防止 Panic |
 | 13 | Web 页面高频刷新致内存碎片化 | **已修复** | 状态页增加 `html.reserve(4096)`，并限制 `GET_PORT_STATUS` 降频至最多 10 秒刷新一次，防止卡死核心队列 |
-| 14 | 控制传输超时后 Use-After-Free | 未修复 | `usbCtrlSync` 超时退出目前仍直接 `free(xfer)`，潜在导致野指针。需增加类似 Bulk OUT 的生命周期安全等待保护 |
-| 15 | 日志任务错误重置打印业务 FD | 未修复 | `tcpLogTask` 断开连接时错误执行 `s_rawClientFd = -1`，会意外掐断 TCP 9100 的后续真实状态回传链路 |
-| 16 | 打印长篇文档/高分辨率图片被截断 | 未修复 | “静默 2 秒发送合成 `JOB END`” 对复杂文档栅格化耗时容忍度过低，导致连接被意外掐断，任务大图打一半退出。建议延长至 8-10 秒 |
+| 14 | 控制传输超时后 Use-After-Free | **已修复** | `usbCtrlSync` 发生超时后也会使用 `halt` 与 `flush` 安全挂起，并等待吸收异步回调，防止指针悬空与内存越界访问 |
+| 15 | 日志任务错误重置打印业务 FD | **已修复** | `tcpLogTask` 断开连接时不再修改 `s_rawClientFd`，已完全解决双任务竞争引发的真实业务数据流断连隐患 |
+| 16 | 打印长篇文档/高分辨率图片被截断 | **已修复** | 延长了闲置判定 (drain) 从 2 秒到了 8 秒，显著兼容了 Mac 处理大照片时缓慢光栅化产生的空档期，杜绝提前注入 `JOB END` 断连 |
 
 ---
 
