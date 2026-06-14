@@ -1,11 +1,31 @@
+PlatformIO test directory.
 
-This directory is intended for PlatformIO Test Runner and project tests.
+Layout
+------
+  test/test_native/   Host unit tests (Unity).  Run on the build machine, no
+                      board required:
 
-Unit Testing is a software testing method by which individual units of
-source code, sets of one or more MCU program modules together with associated
-control data, usage procedures, and operating procedures, are tested to
-determine whether they are fit for use. Unit testing finds problems early
-in the development cycle.
+                          pio test -e native
 
-More information about PlatformIO Unit Testing:
-- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+                      Covers the pure-logic modules:
+                        - job_log   (test_job_log.cpp)   ring, signature
+                                    classification, counters, name tables
+                        - log_sink  (test_log_sink.cpp)  ring write/snapshot,
+                                    wrap, cursor streaming, tee helpers
+                      test_main.cpp owns the Unity runner; test_support.*
+                      provides the fake clock + Serial capture.
+
+  test/shims/         Header-only stand-ins (freertos/, esp_timer.h, esp_log.h,
+                      Arduino.h) that let the real src/*.cpp compile on the host.
+                      Used ONLY by the native env; the firmware build uses the
+                      genuine ESP-IDF headers.
+
+The embedded env (esp32-s3-n16r8) sets test_ignore = test_native so a board
+test run never tries to build the host-only tests.
+
+Modules with heavy hardware/RTOS coupling (usb_bridge, net_server, http_status)
+are not unit-tested here - they are exercised by the on-device end-to-end path
+(print a job; inspect /jobs and the :9101 log).
+
+More on PlatformIO Unit Testing:
+  https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
