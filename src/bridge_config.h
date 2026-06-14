@@ -18,11 +18,11 @@
 // Wi-Fi / mDNS / network identity
 // -----------------------------------------------------------------------------
 
-static const char    *kSsid           = WIFI_SSID;
-static const char    *kPassword       = WIFI_PASSWORD;
-static const char    *kMdnsHostname   = MDNS_HOSTNAME;
-static const char    *kPrinterName    = PRINTER_FRIENDLY_NAME;
-static const uint16_t kRawPort        = 9100;
+extern const char    * const kSsid;
+extern const char    * const kPassword;
+extern const char    * const kMdnsHostname;
+extern const char    * const kPrinterName;
+extern const uint16_t       kRawPort;
 
 // -----------------------------------------------------------------------------
 // USB Printer Class identifiers (USB_CLASS_PRINTER == 0x07 already defined in

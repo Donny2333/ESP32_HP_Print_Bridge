@@ -148,7 +148,7 @@ JZJZ ...                         ← ZJStream magic
 
 | 模块 | 说明 |
 |---|---|
-| `main.cpp` (`setup`/`loop`) | 入口：起 log sink、分配缓冲、`startWifi`/`startMdns`/`startUsbHost`、建各任务；loop 仅跑 HTTP server |
+| `main.cpp` (`setup`/`loop`) | 入口：起 log sink、分配缓冲、`startWifi`（带 Wi-Fi event handler 自动重启 mDNS）/`startMdns`/`startUsbHost`、建各任务；loop 仅跑 HTTP server |
 | `bridge_state.*` | 跨模块共享全局的唯一定义 + `extern` 声明（`s_usb`、统计量、`s_printerReady`/`s_deviceId`/`s_portStatus` 等） |
 | `bridge_config.h` | 全部编译期常量（Wi-Fi/端口/缓冲大小/超时阈值/USB 请求码） |
 | `job_log.*` / `log_sink.*` | 诊断环形缓冲（任务历史 / 远程日志旁路） |
@@ -516,7 +516,7 @@ coredump  0xFF0000   64K
 | 6 | ZJS 签名误报 `PJL_NO_ZJS` | **已修复** | 扫描 incoming chunk 直接检测 ZJS token |
 | 7 | `printer not ready` 时丢弃数据 | **已修复** | 改为阻塞等待，超时则直接切断 TCP 让对端感知失败重试 |
 | 8 | 控制传输跨任务并发 | **已修复** | 新增 `s_usbControlMux` 全局互斥锁，彻底串行化 `GET_PORT_STATUS`、`SOFT_RESET` 和 attach 阶段的控制端点请求，防止驱动死锁 |
-| 9 | Wi-Fi 重连后 mDNS 不重启 | 未修复 | 监听 WiFi event 自动重启 mDNS |
+| 9 | Wi-Fi 重连后 mDNS 不重启 | **已修复** | 监听 Wi-Fi 事件并在重新获取 IP 时自动重启 mDNS 服务 |
 | 10 | 没有 OTA | **已修复** | 使用 `ota_16mb.csv` 双 OTA 分区表 + ArduinoOTA |
 | 11 | macOS HP PPD 默认手动进纸 | **已修复** | `esp32_printer` 队列 PPD 增加 `InputSlot Auto` 并设为默认，避免打印机闪灯等待手动进纸 |
 | 12 | Bulk OUT 超时后 Use-After-Free | **已修复** | `usbBulkOutSync` 超时不再立刻 free，强制执行 `halt` 和 `flush` 终结 in-flight 状态，安全吸收回调防止 Panic |
@@ -540,7 +540,7 @@ macOS 通过 HP JetDirect（TCP:9100）协议打印时，CUPS 的 `rastertozjs` 
 
 ### 解决方案：合成 PJL 状态注入
 
-ESP32 在检测到 **USB Bulk OUT 流量已静默 2 秒**（表示打印数据已全部写入打印机）后，**主动向 TCP 回送通道注入** 107 字节的合成 PJL 状态消息：
+ESP32 在检测到 **USB Bulk OUT 流量已静默 8 秒**（表示打印数据已全部写入打印机且打印机处于空闲）后，**主动向 TCP 回送通道注入** 107 字节的合成 PJL 状态消息，并在注入后再等待 2 秒让 CUPS 消化：
 
 ```
 \r\n@PJL USTATUS JOB\r\nEND\r\nNAME="job"\r\nPAGES=1\r\n\x0c
