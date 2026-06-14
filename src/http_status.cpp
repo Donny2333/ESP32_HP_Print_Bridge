@@ -56,18 +56,26 @@ static String portStatusDescr(uint8_t st)
   return s;
 }
 
+static uint32_t s_lastPortStatusTryMs = 0;
+
 void handleRoot()
 {
   if (s_printerReady && s_portStatus == kPortStatusUnknown)
   {
-    uint8_t st = 0;
-    if (usbCtrlGetPortStatus(&st) == ESP_OK)
+    if (millis() - s_lastPortStatusTryMs > 10000)
     {
-      s_portStatus = st;
+      s_lastPortStatusTryMs = millis();
+      uint8_t st = 0;
+      if (usbCtrlGetPortStatus(&st) == ESP_OK)
+      {
+        s_portStatus = st;
+      }
     }
   }
 
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+  String html;
+  html.reserve(4096);
+  html += "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   html += "<title>ESP32 USB Print Bridge</title>";
   html += "<style>body{font-family:-apple-system,sans-serif;max-width:720px;margin:2em auto;padding:0 1em;color:#222}";
   html += "h1{margin-bottom:0}code,pre{background:#f4f4f4;padding:2px 4px;border-radius:3px}";
@@ -267,7 +275,9 @@ void handleJobs()
 
   if (html)
   {
-    String body = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+    String body;
+    body.reserve(8192);
+    body += "<!DOCTYPE html><html><head><meta charset='utf-8'>";
     body += "<title>Jobs - ESP32 Print Bridge</title>";
     body += "<style>body{font-family:-apple-system,sans-serif;max-width:1100px;margin:1.5em auto;padding:0 1em;color:#222}";
     body += "h2{margin-top:1.6em}.job{border:1px solid #ddd;border-radius:6px;padding:.8em 1em;margin:1em 0;background:#fafafa}";
@@ -334,7 +344,9 @@ void handleJobs()
   }
 
   // --- JSON ---
-  String body = "[";
+  String body;
+  body.reserve(4096);
+  body += "[";
   for (size_t i = 0; i < n; i++)
   {
     const JobRecord &j = arr[i];
