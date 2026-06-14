@@ -84,28 +84,38 @@ void handleRoot()
   html += "<h1>ESP32 USB Print Bridge</h1>";
   html += "<p>Bridge to HP LaserJet M1136 over USB &mdash; clients print via TCP <code>:9100</code>.</p>";
   html += "<table>";
+
+  // --- 1. 核心打印状态 ---
+  html += "<tr><td>Printer</td><td><span class='";
+  html += s_printerReady ? "ok'>READY" : "bad'>not connected";
+  html += "</span></td></tr>";
+  html += "<tr><td>Port status</td><td>" + portStatusDescr(s_portStatus) + "</td></tr>";
+  html += "<tr><td>Jobs accepted</td><td>" + String((unsigned)s_jobsAccepted) + " (dropped: " + String((unsigned)s_jobsDropped) + ")</td></tr>";
+
+  // --- 2. 网络与连接信息 ---
   html += "<tr><td>Wi-Fi</td><td>" + WiFi.localIP().toString() + " (" + macToString() + ")</td></tr>";
+  html += "<tr><td>mDNS</td><td><code>" + String(kMdnsHostname) + ".local</code></td></tr>";
+  html += "<tr><td>Listen port</td><td>TCP " + String(kRawPort) + " (HP JetDirect / AppSocket)</td></tr>";
+
+  // --- 3. 设备硬件身份 ---
+  html += "<tr><td>Identity</td><td>" + String(s_printerIdent) + "</td></tr>";
+  if (s_deviceId[0])
+  {
+    html += "<tr><td>Device ID</td><td><code style='word-break:break-all'>" + String(s_deviceId) + "</code></td></tr>";
+  }
+
+  // --- 4. 系统与维护 ---
   html += "<tr><td>Firmware</td><td>" + String(FW_VERSION) +
           " (git " + String(FW_GIT_REV) + ", " + String(FW_GIT_DIRTY) +
           ", built " + String(FW_BUILD_TIME) + ")</td></tr>";
-  html += "<tr><td>mDNS</td><td><code>" + String(kMdnsHostname) + ".local</code></td></tr>";
   html += "<tr><td>OTA</td><td>" + String(otaStatusText());
   if (otaInProgress())
   {
     html += " (" + String((unsigned)otaProgressPercent()) + "%)";
   }
   html += "</td></tr>";
-  html += "<tr><td>Printer</td><td><span class='";
-  html += s_printerReady ? "ok'>READY" : "bad'>not connected";
-  html += "</span></td></tr>";
-  html += "<tr><td>Identity</td><td>" + String(s_printerIdent) + "</td></tr>";
-  if (s_deviceId[0])
-  {
-    html += "<tr><td>Device ID</td><td><code style='word-break:break-all'>" + String(s_deviceId) + "</code></td></tr>";
-  }
-  html += "<tr><td>Port status</td><td>" + portStatusDescr(s_portStatus) + "</td></tr>";
-  html += "<tr><td>Listen port</td><td>TCP " + String(kRawPort) + " (HP JetDirect / AppSocket)</td></tr>";
-  html += "<tr><td>Jobs accepted</td><td>" + String((unsigned)s_jobsAccepted) + " (dropped: " + String((unsigned)s_jobsDropped) + ")</td></tr>";
+
+  // --- 5. 底层调试数据 ---
   html += "<tr><td>Last job bytes</td><td>" + String((unsigned)s_lastJobBytes) + "</td></tr>";
   html += "<tr><td>Bytes in / out / back</td><td>" + String((unsigned)s_totalBytesIn) +
           " / " + String((unsigned)s_totalBytesOut) +
