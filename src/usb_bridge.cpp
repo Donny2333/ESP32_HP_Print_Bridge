@@ -493,6 +493,16 @@ static esp_err_t usbCtrlSync(uint8_t bmRequestType, uint8_t bRequest,
       usb_host_client_handle_events(s_usb.client, pdMS_TO_TICKS(10));
       if (millis() >= deadline)
       {
+        logTeeln("[usb-cli] control transfer timeout (semaphore)");
+        usb_host_endpoint_halt(s_usb.device, 0);
+        usb_host_endpoint_flush(s_usb.device, 0);
+        // Absorb the callback that might be dispatched due to flush
+        uint32_t absorbDeadline = millis() + 500;
+        while (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(10)) != pdTRUE)
+        {
+          usb_host_client_handle_events(s_usb.client, pdMS_TO_TICKS(10));
+          if (millis() >= absorbDeadline) break;
+        }
         err = ESP_ERR_TIMEOUT;
         break;
       }
@@ -680,6 +690,10 @@ void usbWriterTask(void *arg)
           jobOnDropped(sizeof(chunk));
         }
         if (drained) logTee("[usb-out] drained extra %u bytes\n", (unsigned)drained);
+        
+        // Signal the raw9100 server task to drop the TCP connection immediately.
+        s_usbConsecutiveErrors = kMaxConsecutiveUsbErrors + 1;
+        
         continue;
       }
     }
