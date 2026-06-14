@@ -54,3 +54,8 @@ CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
 # --- Arduino as ESP-IDF component ---
 # Let Arduino auto-start app_main() (calls setup()/loop()).
 CONFIG_AUTOSTART_ARDUINO=y
+
+# Log Level (Warning)
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL=2
+CONFIG_LOG_MAXIMUM_LEVEL=2
