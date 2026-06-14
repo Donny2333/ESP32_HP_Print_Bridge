@@ -44,6 +44,9 @@ static esp_err_t usbCtrlGetDeviceId(char *out, size_t outSz);
 
 static const char *epDirStr(uint8_t addr) { return (addr & 0x80) ? "IN" : "OUT"; }
 
+// Mutex to serialise control transfers (GET_PORT_STATUS, SOFT_RESET, etc.)
+static SemaphoreHandle_t s_usbControlMux = nullptr;
+
 // Wait until printer is attached (or timeout).  Returns true if ready.
 bool waitForPrinter(uint32_t timeoutMs)
 {
@@ -437,10 +440,19 @@ static esp_err_t usbCtrlSync(uint8_t bmRequestType, uint8_t bRequest,
 {
   if (!s_usb.claimed) return ESP_ERR_INVALID_STATE;
 
+  if (s_usbControlMux == nullptr) {
+    s_usbControlMux = xSemaphoreCreateMutex();
+  }
+
+  if (s_usbControlMux) xSemaphoreTake(s_usbControlMux, portMAX_DELAY);
+
   // Control transfer allocation must include the 8-byte setup packet.
   usb_transfer_t *xfer = nullptr;
   esp_err_t err = usb_host_transfer_alloc(8 + wLength, 0, &xfer);
-  if (err != ESP_OK) return err;
+  if (err != ESP_OK) {
+    if (s_usbControlMux) xSemaphoreGive(s_usbControlMux);
+    return err;
+  }
 
   // Setup packet (little-endian)
   xfer->data_buffer[0] = bmRequestType;
@@ -507,6 +519,7 @@ static esp_err_t usbCtrlSync(uint8_t bmRequestType, uint8_t bRequest,
 
   vSemaphoreDelete(ctx.done);
   usb_host_transfer_free(xfer);
+  if (s_usbControlMux) xSemaphoreGive(s_usbControlMux);
   return err;
 }
 
@@ -620,6 +633,9 @@ static esp_err_t usbBulkOutSync(const uint8_t *data, size_t len, uint32_t timeou
     if (xSemaphoreTake(ctx.done, pdMS_TO_TICKS(timeoutMs + 200)) != pdTRUE)
     {
       logTeeln("[usb-out] transfer timeout (semaphore)");
+      usb_host_endpoint_halt(s_usb.device, s_usb.epOut);
+      usb_host_endpoint_flush(s_usb.device, s_usb.epOut);
+      xSemaphoreTake(ctx.done, pdMS_TO_TICKS(500));
       err = ESP_ERR_TIMEOUT;
     }
     else
