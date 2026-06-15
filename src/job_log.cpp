@@ -3,9 +3,12 @@
 // =============================================================================
 
 #include "job_log.h"
+#include "mqtt_logger.h"
 
 #include <string.h>
 #include <stdio.h>
+
+#include <Arduino.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -172,8 +175,37 @@ extern "C" void jobAppendPayload(const uint8_t *data, size_t len)
   portEXIT_CRITICAL(&s_mux);
 }
 
+static void publishJobToMqtt(const JobRecord &j)
+{
+    // Serialize to JSON string locally
+    uint32_t now = millis();
+    String body;
+    body.reserve(512);
+    body += "{";
+    body += "\"id\":"               + String((unsigned)j.id);
+    body += ",\"peer\":\""          + String(j.peer_ip) + "\"";
+    body += ",\"start_ms\":"        + String((unsigned)j.start_ms);
+    body += ",\"end_ms\":"          + String((unsigned)j.end_ms);
+    body += ",\"duration_ms\":"     + String((unsigned)((j.end_ms ? j.end_ms : now) - j.start_ms));
+    body += ",\"bytes_in\":"        + String((unsigned)j.bytes_in);
+    body += ",\"bytes_out\":"       + String((unsigned)j.bytes_out);
+    body += ",\"bytes_dropped\":"   + String((unsigned)j.bytes_dropped);
+    body += ",\"peak_stream\":"     + String((unsigned)j.peak_stream_used);
+    body += ",\"usb_err_count\":"   + String((unsigned)j.usb_err_count);
+    body += ",\"usb_timeout_count\":" + String((unsigned)j.usb_timeout_count);
+    body += ",\"last_usb_err\":"    + String((unsigned)j.last_usb_err);
+    body += ",\"close_reason\":\""  + String(jobCloseReasonName(j.close_reason)) + "\"";
+    body += ",\"sig\":\""           + String(jobSigName(j.sig)) + "\"";
+    body += "}";
+
+    mqttPublishJob(body.c_str());
+}
+
 extern "C" void jobEnd(uint8_t close_reason)
 {
+  JobRecord j_copy;
+  bool should_publish = false;
+
   portENTER_CRITICAL(&s_mux);
   if (s_open)
   {
@@ -181,8 +213,17 @@ extern "C" void jobEnd(uint8_t close_reason)
     j.end_ms       = nowMs();
     j.close_reason = (JobCloseReason)close_reason;
     s_open = false;
+    
+    // Copy out the job record while holding the lock
+    j_copy = j;
+    should_publish = true;
   }
   portEXIT_CRITICAL(&s_mux);
+
+  // Publish outside of the critical section
+  if (should_publish) {
+    publishJobToMqtt(j_copy);
+  }
 }
 
 extern "C" void jobOnUsbWrite(size_t bytes)

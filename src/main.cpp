@@ -50,6 +50,7 @@
 #include "job_log.h"
 #include "ota_update.h"
 #include "version.h"
+#include "mqtt_logger.h"
 
 // -----------------------------------------------------------------------------
 // Back-channel ring buffer: printer Bulk IN → this buffer → TCP client.
@@ -141,6 +142,7 @@ static void wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info)
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       logTee("[wifi] got ip: %s\n", WiFi.localIP().toString().c_str());
       startMdns();
+      mqttLoggerInit();
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       logTeeln("[wifi] disconnected, waiting for reconnect...");

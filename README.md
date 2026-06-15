@@ -152,6 +152,7 @@ JZJZ ...                         ← ZJStream magic
 | `bridge_state.*` | 跨模块共享全局的唯一定义 + `extern` 声明（`s_usb`、统计量、`s_printerReady`/`s_deviceId`/`s_portStatus` 等） |
 | `bridge_config.h` | 全部编译期常量（Wi-Fi/端口/缓冲大小/超时阈值/USB 请求码） |
 | `job_log.*` / `log_sink.*` | 诊断环形缓冲（任务历史 / 远程日志旁路） |
+| `mqtt_logger.*` | 后台轮询与发布服务，向 MQTT Broker 推送日志与打印任务记录，解决离线状态无法追踪和审计的问题 |
 
 **任务/核心分配：**
 - Core 0：USB lib（pri 5）、USB client（pri 4）、USB writer（pri 4）、USB reader（pri 3，已禁用）
@@ -231,6 +232,13 @@ pio device monitor
 - 累计字节 / 当前任务字节
 - 内存占用
 - `/reset` 软复位打印机端口
+
+### 7. 配置 MQTT 日志与审计 (可选)
+
+由于设备没有 USB 线连接时如果崩溃会难以排查，当前版本增加了 MQTT 推送功能：
+1. 修改 `include/secrets.h` 中的 `MQTT_BROKER_URI`（例如 `"mqtt://192.168.1.100:1883"`），并填入用户名密码。
+2. 重新编译烧录或 OTA。
+3. 系统会在后台**异步、低优先级地**将底层系统日志发送到 `esp32_printer/logs` 主题，并将每次打印完结的任务状态记录以 JSON 格式发送到 `esp32_printer/jobs` 主题。
 
 ---
 
