@@ -72,6 +72,9 @@ JZJZ ...                         ← ZJStream magic
 - **Wi-Fi 协议**：HP JetDirect / AppSocket（TCP:9100）
 - **服务发现**：mDNS（`_pdl-datastream._tcp` + `_printer._tcp` + `_http._tcp`）
 - **状态页**：HTTP :80
+- **OTA**：ArduinoOTA（Wi-Fi 无线升级，双 OTA 分区）
+- **远程遥测**：MQTT（ESP-IDF 原生 `mqtt_client`，推送系统日志 + 打印任务审计 JSON）
+- **单元测试**：PlatformIO native 环境 + Unity（`pio test -e native`，纯逻辑模块跑在开发机上）
 
 ---
 
@@ -80,26 +83,33 @@ JZJZ ...                         ← ZJStream magic
 ```
 .
 ├── CMakeLists.txt              # IDF 顶层 (arduino-as-component)
-├── platformio.ini              # 板子/USB/PSRAM/分区配置
+├── platformio.ini              # 板子/USB/PSRAM/分区/OTA/native 测试环境
 ├── sdkconfig.defaults          # USB Host / PSRAM / FreeRTOS / 日志路由
 ├── sdkconfig.esp32-s3-n16r8    # 由 PlatformIO 生成（首次 build 后产生）
 ├── sdkconfig.esp32-s3-n16r8-ota # OTA 环境由 PlatformIO 生成
 ├── ota_16mb.csv                # 16MB Flash 双 OTA 分区表（2x5MB app + SPIFFS）
-├── scripts/version.py          # 构建时注入 Git 版本和构建时间
+├── README_mqtt_plan.md         # MQTT 接入计划与风险分析（设计文档）
+├── scripts/version.py          # 构建时注入 Git 版本/dirty/构建时间到 FW_* 宏
 ├── include/
-│   ├── secrets.example.h       # Wi-Fi/mDNS 模板（提交到 git）
+│   ├── secrets.example.h       # Wi-Fi/mDNS/OTA/MQTT 配置模板（提交到 git）
 │   └── secrets.h               # 你的实际凭据（**不提交**，已在 .gitignore）
 ├── src/
 │   ├── CMakeLists.txt          # IDF component register（GLOB_RECURSE src/*.*）
-│   ├── main.cpp                # 启动/接线层：Wi-Fi、mDNS、缓冲分配、建任务、setup/loop
+│   ├── main.cpp                # 启动/接线层：Wi-Fi、mDNS、OTA、缓冲分配、建任务、setup/loop
 │   ├── bridge_config.h         # 编译期配置常量 + USB Printer Class 请求码
 │   ├── bridge_state.h/.cpp     # 跨模块共享全局（UsbState、统计量、打印机状态）+ macToString
 │   ├── usb_bridge.h/.cpp       # USB Host：attach/detach、控制传输、Bulk OUT writer
 │   ├── net_server.h/.cpp       # 原生 lwIP TCP 服务：:9100 打印 + :9101 telnet 日志
 │   ├── http_status.h/.cpp      # HTTP :80 状态页 / /jobs / /tail / /reset
+│   ├── ota_update.h/.cpp       # ArduinoOTA 封装：otaInit/otaHandle + 进度/状态查询
+│   ├── mqtt_logger.h/.cpp      # MQTT 后台发布：系统日志 + 任务审计 JSON
 │   ├── job_log.h/.cpp          # 每个打印任务的事后诊断环形缓冲（16 槽）
-│   └── log_sink.h/.cpp         # 日志环形缓冲（供 :9101 / /tail 远程旁路）
-└── lib/, test/                 # 未使用
+│   ├── log_sink.h/.cpp         # 日志环形缓冲（供 :9101 / /tail / MQTT 远程旁路）
+│   └── version.h               # FW_* 宏的默认值（被 version.py 注入覆盖）
+├── test/
+│   ├── test_native/            # Unity 单元测试：job_log / log_sink 纯逻辑
+│   └── shims/                  # 开发机替身头（FreeRTOS / esp_timer / esp_log / Arduino）
+└── lib/                        # 未使用
 ```
 
 > 早期版本所有逻辑在单个 `main.cpp`（~1100 行）里；现已按子系统拆分为上述多文件。
@@ -120,10 +130,10 @@ JZJZ ...                         ← ZJStream magic
 | `usbHostLibTask` | 跑 USB Host 库事件循环 |
 | `usbClientTask` + `clientEventCb` | 处理 NEW_DEV / DEV_GONE，延迟调用 `usbTryAttachDevice` |
 | `descFindPrinterInterface` | 在 config descriptor 里找 Printer Class 接口 + bulk OUT/IN endpoint |
-| `usbTryAttachDevice` | 打开设备、claim 接口、读 Device ID、读 Port Status、预分配 OUT transfer |
-| `usbCtrlSync` | 同步控制传输，内部 pump `handle_events` 避免死锁 |
-| `usbCtrlGetDeviceId` / `usbCtrlGetPortStatus` / `usbCtrlSoftReset` | Printer Class 控制请求 |
-| `usbWriterTask` | 从 stream buffer 取数据，1024B 一块送 bulk OUT（持久化 transfer） |
+| `usbTryAttachDevice` | 打开设备、claim 接口、settle 300ms、读 Device ID、读 Port Status（均带一次超时重试），最后才置 `s_printerReady`；Bulk OUT 不预分配，走 per-call alloc |
+| `usbCtrlSync` | 同步控制传输，内部 pump `handle_events` 避免死锁；超时则 halt+flush 并吸收回调；由 `s_usbControlMux` 串行化 |
+| `usbCtrlGetDeviceId` / `usbCtrlGetPortStatus` / `usbCtrlSoftReset` | Printer Class 控制请求（wIndex 高字节 = 接口号）|
+| `usbWriterTask` | 从 stream buffer 取数据，≤1024B 一块送 bulk OUT；每次 `usb_host_transfer_alloc`/`free`（per-call，不复用 transfer）|
 | `usbReaderTask` / `backFwdTask` | **已禁用**（Bulk IN 在 ESP-IDF v4.4 下不稳定） |
 | `waitForPrinter` | 阻塞等待打印机就绪（供 writer / raw server 复用） |
 
@@ -148,15 +158,17 @@ JZJZ ...                         ← ZJStream magic
 
 | 模块 | 说明 |
 |---|---|
-| `main.cpp` (`setup`/`loop`) | 入口：起 log sink、分配缓冲、`startWifi`（带 Wi-Fi event handler 自动重启 mDNS）/`startMdns`/`startUsbHost`、建各任务；loop 仅跑 HTTP server |
-| `bridge_state.*` | 跨模块共享全局的唯一定义 + `extern` 声明（`s_usb`、统计量、`s_printerReady`/`s_deviceId`/`s_portStatus` 等） |
+| `main.cpp` (`setup`/`loop`) | 入口：起 log sink、分配缓冲、`startWifi`（带 Wi-Fi event handler 自动重启 mDNS + 启动 MQTT）/`startMdns`/`otaInit`/`startUsbHost`、建各任务；loop 跑 HTTP server + `otaHandle` |
+| `ota_update.*` | ArduinoOTA 封装：`otaInit`（设主机名/密码 + start/end/progress/error 回调）、`otaHandle`（loop 内 pump）、`otaInProgress`/`otaProgressPercent`/`otaStatusText`（供状态页展示） |
+| `bridge_state.*` | 跨模块共享全局的唯一定义 + `extern` 声明（`s_usb`、`s_usbSubmitMux`、统计量、`s_printerReady`/`s_deviceId`/`s_portStatus`、`s_lastUsbWriteMs` 等） |
 | `bridge_config.h` | 全部编译期常量（Wi-Fi/端口/缓冲大小/超时阈值/USB 请求码） |
-| `job_log.*` / `log_sink.*` | 诊断环形缓冲（任务历史 / 远程日志旁路） |
-| `mqtt_logger.*` | 后台轮询与发布服务，向 MQTT Broker 推送日志与打印任务记录，解决离线状态无法追踪和审计的问题 |
+| `job_log.*` / `log_sink.*` | 诊断环形缓冲（任务历史 16 槽 / 远程日志旁路）；`jobEnd` 还会序列化 JobRecord 为 JSON 交给 MQTT |
+| `mqtt_logger.*` | Wi-Fi 获取 IP 后由事件回调启动；后台 `mqttLog` 任务低优先级轮询 log ring 推送到 `…/logs`（QoS 0），任务结束时推送审计 JSON 到 `…/jobs`（QoS 1）；`MQTT_BROKER_URI` 为空则整体禁用 |
 
 **任务/核心分配：**
 - Core 0：USB lib（pri 5）、USB client（pri 4）、USB writer（pri 4）、USB reader（pri 3，已禁用）
-- Core 1：raw9100 server（pri 3）、Arduino loop（HTTP server，pri 1）
+- Core 1：raw9100 server（pri 3）、telnet 日志 `log9101`（pri 2）、MQTT `mqttLog`（pri 1）、Arduino loop（HTTP server + OTA，pri 1）
+- `back-fwd` 转发任务（pri 3，Core 1）随 Bulk IN 一并禁用
 
 **数据流缓冲：**
 - 256 KB **StreamBuffer**，存储区在 PSRAM（`MALLOC_CAP_SPIRAM`）
@@ -164,308 +176,17 @@ JZJZ ...                         ← ZJStream magic
 
 ---
 
-## 快速开始
+## 单元测试
 
-### 1. 准备 Wi-Fi 凭据
-
-```bash
-cp include/secrets.example.h include/secrets.h
-# 编辑 include/secrets.h 填入 SSID/密码/mDNS 主机名
-```
-
-### 2. 编译并烧录
+纯逻辑模块（`job_log` 的签名分类 / 环形缓冲、`log_sink` 的快照与 cursor 流式读取）有一套跑在开发机上的 Unity 测试，**不需要硬件**：
 
 ```bash
-# 一次性安装
-pio platform install espressif32
-
-# 烧录（USB-Serial-JTAG 口接电脑）
-pio run -t upload
-
-# 看日志
-pio device monitor
+pio test -e native
 ```
 
-### 3. 接打印机
+实现方式：`[env:native]` 用 `platform = native` 把 `src/job_log.cpp` / `src/log_sink.cpp` 编译到本机，依赖项由 `test/shims/` 下的替身头满足（FreeRTOS 临界区→空操作、`esp_timer`→假时钟、`esp_log` / Arduino `Serial`→捕获缓冲）。设备构建会忽略 `test_native`（见 `platformio.ini` 的 `test_ignore`）。
 
-把 ESP32-S3 的 **USB-OTG 口** 通过 OTG 线接到 M1136 的 USB-B 口，打印机开机。看日志应有：
-
-```
-[usb-cli] NEW_DEV addr=1
-[usb-cli] device VID=0x03F0 PID=0x???? ...
-[usb-cli]  intf #X alt=0 class=0x07 sub=0x01 proto=0x02 eps=2
-[usb-cli]   ep 0x?? (OUT) attr=0x02 mps=64
-[usb-cli]   ep 0x?? (IN)  attr=0x02 mps=64
-[usb-cli] claiming if=X epOut=0x?? mps=64 epIn=0x?? mps=64
-[usb-cli] Device ID: MFG:Hewlett-Packard;CMD:ZJS;MDL:HP LaserJet ...
-[usb-cli] printer attached and ready
-```
-
-### 4. 在 macOS 添加打印机
-
-- 系统设置 → 打印机 → `+`
-- **IP** 标签页
-- 协议：**HP JetDirect — Socket**
-- 地址：`esp32-printer.local`（或日志里打印的 IP）
-- 驱动："**HP LaserJet Professional M1130 MFP Series**"
-- 队列名称：`esp32_printer`（后续 AirPrint 广播示例使用这个队列名）
-- 显示名称：`ESP32 Printer`
-- 默认纸张：**A4**
-- 默认进纸：**Auto**（不要让 PPD 强制 `Manual Feed`，否则打印机会闪灯等待手动进纸）
-
-### 5. 打印
-
-随便打一张文档。日志应出现：
-
-```
-[raw9100] connection from 192.168.x.x
-[raw9100] connection closed, job bytes=NNNNNN total in=X out=Y
-```
-
-`Bytes out` 应当等于 `Bytes in`。打印机吐纸。
-
-### 6. 看状态页
-
-浏览器打开 `http://esp32-printer.local/` 看：
-- Wi-Fi 状态、MAC、IP
-- 打印机连接 / Device ID / Port Status
-- 累计字节 / 当前任务字节
-- 内存占用
-- `/reset` 软复位打印机端口
-
-### 7. 配置 MQTT 日志与审计 (可选)
-
-由于设备没有 USB 线连接时如果崩溃会难以排查，当前版本增加了 MQTT 推送功能：
-1. 修改 `include/secrets.h` 中的 `MQTT_BROKER_URI`（例如 `"mqtt://192.168.1.100:1883"`），并填入用户名密码。
-2. 重新编译烧录或 OTA。
-3. 系统会在后台**异步、低优先级地**将底层系统日志发送到 `esp32_printer/logs` 主题，并将每次打印完结的任务状态记录以 JSON 格式发送到 `esp32_printer/jobs` 主题。
-
----
-
-## macOS 共享与 AirPrint 配置
-
-ESP32 固件只提供 TCP `:9100` 原始打印通道，不实现 IPP/AirPrint，也不做 PDF/PWG-Raster 到 ZJStream 的转换。iPhone/iPad 打印需要 Mac 做中转：iOS 通过 AirPrint/IPP 把作业交给 Mac，Mac 的 HP 驱动把作业转换成 M1136 能识别的 `PJL + ZJStream`，再通过 `socket://esp32-printer.local/` 发给 ESP32。
-
-### 1. CUPS 队列要求
-
-macOS 上需要有一个共享打印队列，例如 `esp32_printer`：
-
-```bash
-lpstat -v esp32_printer
-lpoptions -p esp32_printer
-```
-
-期望看到：
-
-```text
-device-uri=socket://esp32-printer.local/
-printer-make-and-model='HP LaserJet Professional M1130 MFP Series, 1.8'
-printer-is-shared=true
-```
-
-这个队列必须保持共享开启。自定义 AirPrint 广播只是让 iPhone 能发现打印机，真正提交打印时仍然访问 Mac CUPS 的 `printers/esp32_printer`。
-
-### 2. 修正 HP PPD 的手动进纸默认值
-
-HP M1130/M1136 的 macOS PPD 可能默认只有 `Manual Feed in Tray 1`：
-
-```text
-*DefaultInputSlot: Manual
-*InputSlot Manual/Manual Feed in Tray 1: "<</MediaPosition 4>>setpagedevice"
-```
-
-这种配置会让 iPhone/Android 作业完整送到打印机后，打印机闪错误灯并等待手动进纸。修正方式是给 PPD 增加一个不强制 `MediaPosition` 的 `Auto` 进纸，并设为默认：
-
-```text
-*DefaultInputSlot: Auto
-*InputSlot Auto/Auto Select: ""
-*InputSlot Manual/Manual Feed in Tray 1: "<</MediaPosition 4>>setpagedevice"
-```
-
-可用下面命令生成修正 PPD 并应用到队列：
-
-```bash
-python3 - <<'PY'
-from pathlib import Path
-src = Path('/private/etc/cups/ppd/esp32_printer.ppd')
-dst = Path('/tmp/esp32_printer-auto.ppd')
-text = src.read_text()
-text = text.replace('*DefaultInputSlot: Manual', '*DefaultInputSlot: Auto')
-text = text.replace('*InputSlot Manual/Manual Feed in Tray 1: "<</MediaPosition 4>>setpagedevice"', '*InputSlot Auto/Auto Select: ""\n*InputSlot Manual/Manual Feed in Tray 1: "<</MediaPosition 4>>setpagedevice"')
-dst.write_text(text)
-print(dst)
-PY
-
-lpadmin -p esp32_printer -P /tmp/esp32_printer-auto.ppd -o PageSize=A4 -o InputSlot=Auto
-```
-
-验证：
-
-```bash
-lpoptions -p esp32_printer -l
-```
-
-期望看到：
-
-```text
-PageSize/Media Size: Letter Legal *A4 ...
-InputSlot/Media Source: *Auto Manual
-```
-
-### 3. 发布 iPhone 可发现的 AirPrint 广播
-
-macOS 自带共享有时只发布普通 `_ipp._tcp` / `_ipps._tcp`，iPhone 原生打印界面可能搜不到。可以额外用 `dns-sd` 注册一个 `_ipp._tcp,_universal` AirPrint 服务，指向同一个 CUPS 队列。
-
-创建 `~/Library/LaunchAgents/com.donny.airprint-esp32.plist`：
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.donny.airprint-esp32</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/bin/dns-sd</string>
-    <string>-R</string>
-    <string>AirPrint for HP M1136</string>
-    <string>_ipp._tcp,_universal</string>
-    <string>local</string>
-    <string>631</string>
-    <string>txtvers=1</string>
-    <string>qtotal=1</string>
-    <string>rp=printers/esp32_printer</string>
-    <string>ty=HP LaserJet Professional M1130 MFP Series</string>
-    <string>note=Shared via Mac to ESP32 USB bridge</string>
-    <string>product=(HP LaserJet Professional M1139 MFP)</string>
-    <string>pdl=application/pdf,image/jpeg,image/png,image/pwg-raster,image/urf</string>
-    <string>URF=CP1,RS600,W8,SRGB24,IS1-4,MT1-2</string>
-    <string>Color=F</string>
-    <string>Duplex=F</string>
-    <string>Copies=T</string>
-    <string>printer-state=3</string>
-    <string>printer-type=0x809056</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>/tmp/com.donny.airprint-esp32.out</string>
-  <key>StandardErrorPath</key>
-  <string>/tmp/com.donny.airprint-esp32.err</string>
-</dict>
-</plist>
-```
-
-加载并设为登录自动启动：
-
-```bash
-launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.donny.airprint-esp32.plist" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.donny.airprint-esp32.plist"
-launchctl enable "gui/$(id -u)/com.donny.airprint-esp32"
-launchctl kickstart -k "gui/$(id -u)/com.donny.airprint-esp32"
-```
-
-验证：
-
-```bash
-launchctl print "gui/$(id -u)/com.donny.airprint-esp32"
-dns-sd -B _ipp._tcp,_universal local
-dns-sd -L "AirPrint for HP M1136" _ipp._tcp local
-ippfind
-```
-
-期望 iPhone 打印界面能看到 `AirPrint for HP M1136`。
-
-### 4. iPhone 打印链路
-
-正常链路如下：
-
-```text
-iPhone AirPrint
-  -> Mac CUPS / HP rastertozjs
-  -> ESP32 raw9100
-  -> USB Bulk OUT
-  -> HP M1136
-```
-
-ESP32 `/jobs` 里成功任务应满足：
-
-```text
-sig = HP_UEL_PJL_ZJS
-bytes_in == bytes_out
-usb_err_count = 0
-close_reason = job_complete
-```
-
----
-
-## OTA 升级
-
-固件启用了 ArduinoOTA，后续可以通过 Wi-Fi 上传新固件，不必每次插 USB-Serial-JTAG。首次启用 OTA 时仍必须用 USB 串口烧录一次，因为分区表需要从单 app 切换到双 OTA app 槽。
-
-### 1. 配置 OTA 密码
-
-在本地 `include/secrets.h` 中设置密码，不要提交真实密码：
-
-```cpp
-#define OTA_PASSWORD "your-strong-password"
-```
-
-VS Code / PlatformIO 上传时使用同一个密码。
-
-### 2. 首次串口烧录
-
-首次切换到 OTA 分区表时执行：
-
-```bash
-"/Users/donny/.platformio/penv/bin/pio" run -e esp32-s3-n16r8 -t upload
-```
-
-如果自动识别串口失败，先用 `pio device list` 找到 USB-Serial-JTAG 端口，再指定 `--upload-port`。
-
-### 3. 后续命令行 OTA
-
-```bash
-ESP32_OTA_PASSWORD='your-strong-password' \
-  "/Users/donny/.platformio/penv/bin/pio" run -e esp32-s3-n16r8-ota -t upload
-```
-
-OTA 目标默认是：
-
-```text
-esp32-printer.local
-```
-
-### 4. VS Code 一键 OTA
-
-仓库提供 `.vscode/tasks.json`，在 VS Code 中运行：
-
-```text
-Terminal -> Run Task -> PlatformIO: OTA Upload
-```
-
-VS Code 会弹窗输入 OTA 密码，并通过环境变量 `ESP32_OTA_PASSWORD` 传给 PlatformIO，不会把密码写入仓库。
-
-OTA 期间不要打印，保持 ESP32 和电脑在同一 Wi-Fi/VLAN。失败时通常会继续运行旧固件；如果分区表或启动异常，用 USB 串口重新烧录恢复。
-
-### 5. 确认 OTA 是否成功
-
-状态页会显示自动注入的固件版本信息：
-
-```text
-Firmware: <git describe>-dirty (git <short-sha>, dirty, built YYYY-MM-DD HH:MM:SS)
-```
-
-其中：
-- `FW_VERSION` 来自 `git describe --tags --always`，工作区有未提交改动时追加 `-dirty`
-- `FW_GIT_REV` 是当前短 commit
-- `FW_GIT_DIRTY` 是 `clean` / `dirty`
-- `FW_BUILD_TIME` 是本次构建时间
-
-OTA 完成后打开 `http://esp32-printer.local/`，确认 `Firmware` 行的 Git 或构建时间变化即可判断升级成功。
+覆盖点：签名识别（`HP_UEL_PJL_ZJS` / `PJL_NO_ZJS` / `POSTSCRIPT` / `PDF` / `PWG_RASTER` / `OTHER_BINARY`）、跨 chunk 边界检测 ZJS、任务环形缓冲 16 槽回绕、字节/错误计数器、日志 ring 回绕与 cursor 追读。
 
 ---
 
@@ -523,7 +244,7 @@ coredump  0xFF0000   64K
 | 5 | TCP idle 超时过短 | **已修复** | `SO_RCVTIMEO=2s` + 120s 兜底 |
 | 6 | ZJS 签名误报 `PJL_NO_ZJS` | **已修复** | 扫描 incoming chunk 直接检测 ZJS token |
 | 7 | `printer not ready` 时丢弃数据 | **已修复** | 改为阻塞等待，超时则直接切断 TCP 让对端感知失败重试 |
-| 8 | 控制传输跨任务并发 | **已修复** | 新增 `s_usbControlMux` 全局互斥锁，彻底串行化 `GET_PORT_STATUS`、`SOFT_RESET` 和 attach 阶段的控制端点请求，防止驱动死锁 |
+| 8 | 控制传输跨任务并发 | **已修复** | 新增 `s_usbControlMux`（`usb_bridge.cpp` 文件内 static），彻底串行化 `GET_PORT_STATUS`、`SOFT_RESET` 和 attach 阶段的控制端点请求，防止驱动死锁 |
 | 9 | Wi-Fi 重连后 mDNS 不重启 | **已修复** | 监听 Wi-Fi 事件并在重新获取 IP 时自动重启 mDNS 服务 |
 | 10 | 没有 OTA | **已修复** | 使用 `ota_16mb.csv` 双 OTA 分区表 + ArduinoOTA |
 | 11 | macOS HP PPD 默认手动进纸 | **已修复** | `esp32_printer` 队列 PPD 增加 `InputSlot Auto` 并设为默认，避免打印机闪灯等待手动进纸 |
@@ -531,7 +252,7 @@ coredump  0xFF0000   64K
 | 13 | Web 页面高频刷新致内存碎片化 | **已修复** | 状态页增加 `html.reserve(4096)`，并限制 `GET_PORT_STATUS` 降频至最多 10 秒刷新一次，防止卡死核心队列 |
 | 14 | 控制传输超时后 Use-After-Free | **已修复** | `usbCtrlSync` 发生超时后也会使用 `halt` 与 `flush` 安全挂起，并等待吸收异步回调，防止指针悬空与内存越界访问 |
 | 15 | 日志任务错误重置打印业务 FD | **已修复** | `tcpLogTask` 断开连接时不再修改 `s_rawClientFd`，已完全解决双任务竞争引发的真实业务数据流断连隐患 |
-| 16 | 打印长篇文档/高分辨率图片被截断 | **已修复** | 延长了闲置判定 (drain) 从 2 秒到了 8 秒，显著兼容了 Mac 处理大照片时缓慢光栅化产生的空档期，杜绝提前注入 `JOB END` 断连 |
+| 16 | 打印长篇文档/高分辨率图片被截断 | **已修复** | 合成 `JOB END` 注入的 **USB 静默判定**从 2 秒延长到 8 秒（`net_server.cpp` 中 `s_lastUsbWriteMs` 空档阈值），显著兼容 Mac 处理大照片时缓慢光栅化产生的空档期，杜绝提前注入断连。注意此值与 drain 阶段的 `kDrainQuiescentMs=1.5s` 是两个独立计时器 |
 
 ---
 
@@ -582,147 +303,9 @@ USB 控制传输（`GET_DEVICE_ID`、`GET_PORT_STATUS`）的完成回调需要 `
 1. `usbTryAttachDevice()` 不在 `clientEventCb` 回调中直接调用，而是通过 `s_pendingAttachAddr` 标志延迟到 `usbClientTask` 主循环中执行
 2. `usbCtrlSync()` 在等待控制传输完成时主动 pump `usb_host_client_handle_events()`
 
----
-
-## 故障排查
-
-### 远程排错（第一件事就做这个）
-
-固件内置了**任务历史 + 实时日志旁路**，绝大多数"不出纸"问题在 macOS 终端里 30 秒就能定位，不需要 USB-Serial-JTAG 线。
-
-#### 远程"串口"：通过 Wi-Fi 看 ESP32 的全部日志
-
-适合 **物理上 ESP32 OTG 接打印机、Serial-JTAG 口不方便接电脑** 的场景。所有原本写到 USB-Serial-JTAG 的日志会同时镜像到 Wi-Fi 端：
-
-| 用法 | 命令 | 说明 |
-|---|---|---|
-| **实时滚动**（最像 `screen /dev/cu.*`） | `nc esp32-printer.local 9101` | 连上后先看到 ring 里的近期日志快照 + banner，然后实时追加 |
-| **浏览器快照** | 打开 `http://esp32-printer.local/tail` | 8 KB 日志快照，HTML 着色 |
-| **纯文本快照** | `curl 'http://esp32-printer.local/tail.txt?n=4096'` | 适合 grep / less |
-| **任务历史** | `curl http://esp32-printer.local/jobs \| jq` | 见下文"任务结果" |
-
-约定：
-- 远程日志行前会自带毫秒级时间戳 `[12345] ...`，便于排序与对照
-- 本地 USB-Serial-JTAG 输出**不变**（保持无时间戳的原样）
-- :9101 同一时刻只允许一个连接；新连接会自动踢掉旧的
-- 慢/失联的客户端会被立即丢弃，不会拖慢主循环
-
-**SOP（按顺序做）：**
-
-1. **看最近一次任务的体检报告**
-   ```bash
-   curl -s http://esp32-printer.local/jobs | jq '.[0]'
-   # 或浏览器打开 http://esp32-printer.local/jobs?fmt=html
-   ```
-   关注三个字段：
-   - `sig`：数据格式签名（见下表）
-   - `bytes_in` vs `bytes_out`：TCP 进的 vs USB 出的，**应相等**
-   - `usb_err_count` / `last_usb_err` / `bytes_dropped`：USB 段故障指示
-
-2. **看实时日志**（任何终端，零安装）
-   ```bash
-   nc esp32-printer.local 9101
-   ```
-   连接后会先发一段 ring 缓冲里的近期日志，然后流式追加新行。多 client 时新的会踢掉旧的。
-
-3. **看日志快照（浏览器友好）**
-   ```bash
-   open http://esp32-printer.local/tail              # HTML
-   curl http://esp32-printer.local/tail.txt          # 纯文本
-   curl 'http://esp32-printer.local/tail.txt?n=4096' # 限定大小
-   ```
-
-#### 签名速查表
-
-`/jobs` 里的 `sig` 字段直接告诉你头部是什么协议。
-
-| sig | 含义 | 结论 |
-|---|---|---|
-| `HP_UEL_PJL_ZJS` | 标准 HP UEL + `@PJL ENTER LANGUAGE=ZJS` + ZJStream | **数据正确**，问题不在主机驱动 |
-| `PJL_NO_ZJS` | 有 `@PJL` 但没切到 ZJS | 驱动 PJL 序言不对，M1136 不认 |
-| `POSTSCRIPT` | `%!PS-Adobe...` | **PPD 选错**，换 HP M1130/M1132 系列 |
-| `PWG_RASTER` | `RaS2` / `RaS3` | **PPD 选错**（AirPrint 路径），换 HP M1130 系列 |
-| `PDF` | `%PDF-` | 主机没经过驱动栅格化 |
-| `OTHER_BINARY` | 不匹配任何已知签名 | 看 `/jobs?fmt=html` 里的 hex dump 手工判断 |
-| `UNKNOWN` | 还没拿到 first64 字节 | 任务太短或 TCP 立即断 |
-
-#### 决策树
-
-```
-不出纸
- │
- ├─ /jobs 没有任何 record
- │     → TCP 根本没连上，看 / 状态页 Wi-Fi / IP / mDNS
- │
- ├─ sig=HP_UEL_PJL_ZJS
- │     ├─ in==out 且 usb_err=0   → 打印机收齐了；若闪灯看 Port Status / InputSlot
- │     ├─ bytes_dropped > 0      → "printer not ready" 期间被丢；看实时日志找原因
- │     └─ usb_err_count > 0      → USB 段卡，看 last_usb_err（0x103=TIMEOUT 0x108=STALL）
- │
- ├─ sig ∈ {POSTSCRIPT, PWG_RASTER, PDF, PJL_NO_ZJS}
- │     → 100% 主机端驱动选错；换 "HP LaserJet Professional M1130 MFP Series" PPD
- │
- └─ sig=OTHER_BINARY / UNKNOWN
-       → 看 /jobs?fmt=html 的 hex dump 人工判断
-```
-
-#### 端口一览
-
-| 端口 | 协议 | 用途 |
-|---|---|---|
-| `:80` | HTTP | 状态页 `/`、任务历史 `/jobs`、日志快照 `/tail`、`/tail.txt`、软复位 `/reset` |
-| `:9100` | TCP raw | HP JetDirect 打印数据（双向：OUT=打印流，IN=合成 PJL 状态） |
-| `:9101` | TCP telnet | 实时日志流（`nc esp32-printer.local 9101`） |
-
-> **可达性提示**：以上端口都绑 0.0.0.0，只要 Mac 和 ESP32 在同一局域网（路由器未开启"AP 隔离 / Client Isolation"）就能直连。无需公网、无需 VPN、无需云服务。如 `.local` 不解析，直接用 IP（看状态页或路由器后台获取）。
-
----
-
-### 看不到日志
-- 确认电脑接的是 ESP32-S3 的 **USB-Serial-JTAG 口**（不是 OTG 口）
-- 端口名 macOS：`/dev/cu.usbmodem*`，Linux：`/dev/ttyACM*`
-- 波特率 115200
-
-### 接打印机没反应（`NEW_DEV` 没出现）
-- USB OTG 线方向：板上 OTG → USB-A 母 → USB-B 公到打印机
-- VBUS 供电是否到位（万用表测 OTG 口 D+ 旁 5V）
-- 打印机自己是否上电、空闲态
-
-### `Device ID` 是空或乱码
-- 看 #3 已知问题：可能是控制传输 wIndex 编码 + buffer 偏移问题（GET_DEVICE_ID 当前能拿到，但 Port Status 一定是 0）
-- 真正卡这里说明 claim 选错了接口
-
-### TCP 连上了但打印机不出纸
-1. 看状态页 `Bytes in / out` 是否相等
-   - 不相等 → USB 写卡了，看日志 `[usb-out] bulk write err=0x?`
-   - 相等且数 KB 以上 → 打印机收到了但不认数据
-2. 用 macOS 本地抓包（参见顶部"前置条件"段），确认头部是 `1B 25 2D 31 32 33 34 35 58` + `@PJL ENTER LANGUAGE=ZJS`
-3. 如果抓包发现是 PostScript / PWG-Raster → **驱动问题**，不是 ESP32 问题
-
-### iPhone 搜不到 `AirPrint for HP M1136`
-- 确认 Mac 上 AirPrint 广播服务正在运行：
-  ```bash
-  launchctl print "gui/$(id -u)/com.donny.airprint-esp32"
-  ```
-- 确认 Bonjour 能看到 `_universal` 服务：
-  ```bash
-  dns-sd -B _ipp._tcp,_universal local
-  ```
-- 如果 Mac 能看到但 iPhone 看不到，确认 iPhone 和 Mac 在同一 Wi-Fi/VLAN，路由器没有开启 AP Isolation / Client Isolation。
-- 关闭再打开 iPhone Wi-Fi，或退出打印界面重进；Bonjour 有缓存延迟。
-
-### iPhone 能打印但打印机闪灯不出纸
-- 先看 ESP32 `/jobs`：若 `sig=HP_UEL_PJL_ZJS`、`bytes_in==bytes_out`、`usb_err_count=0`，说明数据和 USB 链路正常。
-- 打开 ESP32 状态页；若 `Port status` 显示 `PAPER EMPTY`，通常是打印机等待纸张/进纸。
-- 检查 Mac 队列是否仍强制手动进纸：
-  ```bash
-  lpoptions -p esp32_printer -l
-  ```
-- 期望 `InputSlot/Media Source` 为 `*Auto Manual`；如果只有 `*Manual`，按“macOS 共享与 AirPrint 配置”里的 PPD 修正步骤处理。
-- 临时验证方法：在手动进纸口放一张 A4 并按继续/OK；如果能打印，说明就是 `Manual Feed` 配置问题。
-
-### `Port status = 0x00`
-- 大概率是上面已知问题 #3 导致的误诊断，不一定真离线
+并发安全由**两把互斥锁**保证：
+- `s_usbControlMux`（`usb_bridge.cpp` 文件内 static，首次调用 `usbCtrlSync` 时惰性创建）：串行化所有控制端点请求（`GET_DEVICE_ID` / `GET_PORT_STATUS` / `SOFT_RESET` 及 attach 阶段），防止驱动死锁
+- `s_usbSubmitMux`（`bridge_state` 全局，在 `startUsbHost()` 创建）：串行化 Bulk OUT 提交，规避 ESP-IDF v4.4 USB Host driver 非重入问题
 
 ---
 

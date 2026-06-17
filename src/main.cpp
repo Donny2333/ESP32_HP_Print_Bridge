@@ -8,7 +8,7 @@
 //      System Settings -> Printers & Scanners -> Add Printer
 //      IP tab, Protocol = "HP JetDirect - Socket"
 //      Address = this device's IP (or esp32-printer.local), Port = 9100
-//      Driver  = "HP LaserJet Professional M1132 MFP" (works for M1136).
+//      Driver  = "HP LaserJet Professional M1130 MFP Series" (works for M1136).
 //  - macOS rasterizes PDF -> ZJStream via the HP driver and pipes the bytes
 //    over TCP:9100. We forward every byte 1:1 to the printer's USB Bulk OUT
 //    endpoint.

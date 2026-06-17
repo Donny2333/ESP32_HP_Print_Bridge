@@ -184,7 +184,7 @@ void handleRoot()
   html += "<li>System Settings &rarr; Printers &amp; Scanners &rarr; Add Printer</li>";
   html += "<li>IP tab. Protocol: <b>HP JetDirect &mdash; Socket</b></li>";
   html += "<li>Address: <code>" + WiFi.localIP().toString() + "</code> &nbsp; (or <code>" + String(kMdnsHostname) + ".local</code>)</li>";
-  html += "<li>Driver: <b>HP LaserJet Professional M1132 MFP</b> (works for M1136).</li>";
+  html += "<li>Driver: <b>HP LaserJet Professional M1130 MFP Series</b> (works for M1136).</li>";
   html += "</ol>";
   html += "<p><a href='/reset'>Send SOFT_RESET to printer</a></p>";
   html += "</body></html>";
